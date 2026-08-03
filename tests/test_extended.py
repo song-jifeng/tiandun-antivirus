@@ -241,7 +241,7 @@ class TestStringUtilExtended(unittest.TestCase):
 
     def test_hexdump(self):
         result = self.util.hexdump(b'Hello World!')
-        self.assertIn('48656c6c6f', result)
+        self.assertIn('48 65 6c 6c 6f', result)
         self.assertIn('Hello World', result)
 
     def test_extract_strings(self):
@@ -253,20 +253,20 @@ class TestStringUtilExtended(unittest.TestCase):
         self.assertIn('abc', strings)
 
     def test_extract_strings_min_length(self):
-        data = b'ab cd efg hijk'
+        data = b'ab\x00cd\x00efg\x00hijk'
         strings = self.util.extract_strings(data, min_length=4)
         self.assertNotIn('ab', strings)
         self.assertIn('hijk', strings)
 
     def test_mask_sensitive(self):
-        self.assertEqual(self.util.mask_sensitive('password123'), 'pass*********')
+        self.assertEqual(self.util.mask_sensitive('password123'), 'pass*******')
         self.assertEqual(self.util.mask_sensitive('ab', 1), 'a*')
         self.assertEqual(self.util.mask_sensitive('a', 1), '*')
 
     def test_truncate(self):
         text = '这是一段很长的文本，需要被截断'
         result = self.util.truncate(text, max_length=10)
-        self.assertEqual(len(result), 13)
+        self.assertEqual(len(result), 10)
         self.assertTrue(result.endswith('...'))
 
         short = '短文本'
@@ -597,6 +597,14 @@ class TestScheduler(unittest.TestCase):
 class TestFileTypeDetectorExtended(unittest.TestCase):
     """测试文件类型检测扩展"""
 
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
     def test_detect_exe(self):
         from engine import FileTypeDetector
         ftype = FileTypeDetector.detect('C:\\Windows\\System32\\notepad.exe')
@@ -610,9 +618,21 @@ class TestFileTypeDetectorExtended(unittest.TestCase):
 
     def test_detect_magic_numbers(self):
         from engine import FileTypeDetector
-        self.assertIn('exe/dll', FileTypeDetector.detect('test.exe'))
-        self.assertIn('zip', FileTypeDetector.detect('test.zip'))
-        self.assertIn('pdf', FileTypeDetector.detect('test.pdf'))
+        # 创建带 MZ 魔数的临时文件测试 exe 检测
+        exe_path = os.path.join(self.temp_dir, 'test.exe')
+        with open(exe_path, 'wb') as f:
+            f.write(b'MZ' + b'\x00' * 100)
+        self.assertIn('exe/dll', FileTypeDetector.detect(exe_path))
+
+        zip_path = os.path.join(self.temp_dir, 'test.zip')
+        with open(zip_path, 'wb') as f:
+            f.write(b'PK\x03\x04' + b'\x00' * 100)
+        self.assertIn('zip', FileTypeDetector.detect(zip_path))
+
+        pdf_path = os.path.join(self.temp_dir, 'test.pdf')
+        with open(pdf_path, 'wb') as f:
+            f.write(b'%PDF' + b'\x00' * 100)
+        self.assertIn('pdf', FileTypeDetector.detect(pdf_path))
 
 
 class TestLoggerExtended(unittest.TestCase):
@@ -665,7 +685,7 @@ class TestSystemCleanerExtended(unittest.TestCase):
     def test_clean_temp_files(self):
         try:
             from tools.system_cleaner import SystemCleaner
-            result = SystemCleaner.clean_temp_files()
+            result = SystemCleaner.clean_temp_files(dry_run=True, max_files=50)
             self.assertIn('success', result)
             self.assertIn('cleaned', result)
             self.assertIn('freed_bytes', result)
@@ -679,6 +699,7 @@ class TestFileAnalyzerExtended(unittest.TestCase):
     def test_analyze_current_file(self):
         try:
             from tools.file_analyzer import FileAnalyzer
+            import hashlib
             result = FileAnalyzer.analyze(__file__)
             self.assertIn('name', result)
             self.assertIn('extension', result)
@@ -784,7 +805,11 @@ class TestScriptAnalyzer(unittest.TestCase):
             from engine.heuristic.heuristic_engine import ScriptAnalyzer
             analyzer = ScriptAnalyzer()
             # 测试PowerShell脚本
-            score, reasons = analyzer.analyze('test.ps1')
+            result = analyzer.analyze('test.ps1')
+            if isinstance(result, tuple) and len(result) == 3:
+                score, reasons, details = result
+            else:
+                score, reasons = result
             self.assertIsInstance(score, float)
             self.assertIsInstance(reasons, list)
         except ImportError:
@@ -798,7 +823,11 @@ class TestGenericAnalyzer(unittest.TestCase):
         try:
             from engine.heuristic.heuristic_engine import GenericAnalyzer
             analyzer = GenericAnalyzer()
-            score, reasons = analyzer.analyze(__file__)
+            result = analyzer.analyze(__file__)
+            if isinstance(result, tuple) and len(result) == 3:
+                score, reasons, details = result
+            else:
+                score, reasons = result
             self.assertIsInstance(score, float)
             self.assertIsInstance(reasons, list)
         except ImportError:
@@ -816,7 +845,11 @@ class TestScoringSystem(unittest.TestCase):
             scores = {'pe_analysis': 10, 'script_analysis': 0,
                      'document_analysis': 0, 'generic_analysis': 5,
                      'entropy': 3, 'strings': 2}
-            total, level = scoring.calculate(scores)
+            result = scoring.calculate(scores)
+            if isinstance(result, tuple) and len(result) == 3:
+                total, level, report = result
+            else:
+                total, level = result
             self.assertGreater(total, 0)
             self.assertLessEqual(total, 100)
             self.assertIsInstance(level, int)

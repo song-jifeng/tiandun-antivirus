@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import ctypes
 import threading
 from typing import Optional, Dict, Any, List, Tuple
 from collections import defaultdict, deque
@@ -17,6 +18,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from engine import ScanEngine, ScanResult, ThreatInfo, ThreatType, ThreatLevel
 from engine.logger import logger
 from engine.config import config
+from engine.behavior.win_registry import (
+    HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER,
+    KEY_READ, KEY_SET_VALUE, PROCESS_TERMINATE,
+    SYNCHRONIZE, REG_NOTIFY_CHANGE_NAME,
+    REG_NOTIFY_CHANGE_LAST_SET,
+    kill_process, set_file_readonly, RegistryChangeWatcher,
+    format_key_path, delete_value, close_handle,
+    open_process, terminate_process,
+    open_reg_key, close_reg_key, enum_values,
+)
 
 
 class BehaviorEvent:
@@ -253,21 +264,68 @@ class FileMonitor:
 
 
 class RegistryMonitor:
-    """注册表监控器"""
+    """注册表监控器 - 使用 RegNotifyChangeKeyValue 实时监控"""
     def __init__(self):
         self._running = False
         self._events: List[BehaviorEvent] = []
+        self._lock = threading.Lock()
+        self._watchers: List[RegistryChangeWatcher] = []
 
     def start(self):
+        """启动注册表监控"""
+        if self._running:
+            return
         self._running = True
 
+        # 监控目标: Run 启动项 + Services 服务键
+        watch_targets = [
+            (HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            (HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services"),
+        ]
+
+        for hive, sub_key in watch_targets:
+            watcher = RegistryChangeWatcher(
+                hive=hive, sub_key=sub_key,
+                on_change=self._on_change,
+                filter_flags=REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+            )
+            if watcher.start():
+                self._watchers.append(watcher)
+                logger.info(f"注册表监控已启动: {format_key_path(hive, sub_key)}")
+            else:
+                logger.warning(f"注册表监控启动失败: {format_key_path(hive, sub_key)}")
+
     def stop(self):
+        """停止注册表监控"""
         self._running = False
+        for watcher in self._watchers:
+            watcher.stop()
+        self._watchers.clear()
+
+    def _on_change(self, hive_name: str, sub_key: str, action: str, value_name: str):
+        """注册表变化回调"""
+        event = BehaviorEvent(
+            event_type='registry',
+            pid=0,
+            process_name='system',
+            action=action,
+            target=f"{hive_name}\\{sub_key}\\{value_name}",
+            details={
+                'hive': hive_name,
+                'key': sub_key,
+                'value': value_name,
+            }
+        )
+        with self._lock:
+            self._events.append(event)
 
     def get_events(self) -> List[BehaviorEvent]:
-        events = list(self._events)
-        self._events.clear()
-        return events
+        """获取并清空事件列表"""
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+            return events
 
 
 class NetworkMonitor:
@@ -430,12 +488,28 @@ class BehaviorEngine(ScanEngine):
 
 
 class HIPSEngine:
-    """主动防御系统"""
+    """主动防御系统 - 实时拦截高危操作"""
+
+    SUSPICIOUS_NAMES = [
+        'powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe',
+        'mshta.exe', 'rundll32.exe', 'regsvr32.exe',
+    ]
+
+    RUN_KEY_PATHS = [
+        (HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        (HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+        (HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ]
+
     def __init__(self):
         self.enabled = config.get('hips.enabled', True)
         self.level = config.get('hips.level', 'normal')
         self._running = False
         self._thread = None
+        self._wmi_thread = None
+        self._wmi_available = False
+        self._intercepted = 0
 
     def start(self):
         if not self.enabled or self._running:
@@ -443,11 +517,59 @@ class HIPSEngine:
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        # 尝试启动WMI进程创建实时监控
+        self._try_start_wmi_monitor()
         logger.info("HIPS引擎已启动")
 
     def stop(self):
         self._running = False
+        if self._wmi_thread:
+            self._wmi_thread.join(timeout=3)
+            self._wmi_thread = None
 
+    # ------------------------------------------------------------
+    # WMI 进程创建监控（实时）
+    # ------------------------------------------------------------
+    def _try_start_wmi_monitor(self):
+        """尝试使用 WMI Win32_ProcessStartTrace 事件订阅进程创建"""
+        try:
+            import win32com.client  # type: ignore
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", "root\\cimv2")
+            self._wmi_events = service.ExecNotificationQuery(
+                "SELECT * FROM Win32_ProcessStartTrace"
+            )
+            self._wmi_thread = threading.Thread(
+                target=self._wmi_monitor_loop, daemon=True
+            )
+            self._wmi_thread.start()
+            self._wmi_available = True
+            logger.info("HIPS: WMI 进程创建监控已启动")
+        except Exception as e:
+            self._wmi_available = False
+            logger.warning(f"HIPS: WMI 监控不可用，回退到轮询模式: {e}")
+
+    def _wmi_monitor_loop(self):
+        """WMI 事件循环 — 等待进程创建事件"""
+        while self._running and self._wmi_available:
+            try:
+                # 1000 ms 超时; 超时时返回 None 或抛出异常
+                event = self._wmi_events.NextEvent(1000)
+                if event is None:
+                    continue
+                proc_info = {
+                    'pid': event.ProcessID,
+                    'name': event.ProcessName,
+                    'exe': getattr(event, 'ProcessName', ''),
+                }
+                self._evaluate_process(proc_info, source='wmi')
+            except Exception:
+                # 超时异常或其它暂时性错误，继续循环
+                pass
+
+    # ------------------------------------------------------------
+    # 轮询监控（后备）
+    # ------------------------------------------------------------
     def _run(self):
         while self._running:
             try:
@@ -457,7 +579,7 @@ class HIPSEngine:
             time.sleep(5)
 
     def _check_hips_rules(self):
-        """检查HIPS规则"""
+        """检查HIPS规则 - 轮询所有进程"""
         if not config.get('hips.monitor_process_create', True):
             return
         try:
@@ -465,40 +587,127 @@ class HIPSEngine:
             for proc in psutil.process_iter(['pid', 'name', 'exe']):
                 try:
                     if proc.info['exe']:
-                        self._evaluate_process(proc.info)
-                except Exception:
+                        self._evaluate_process(proc.info, source='poll')
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         except ImportError:
             pass
 
-    def _evaluate_process(self, proc_info: Dict):
-        """评估进程风险"""
+    # ------------------------------------------------------------
+    # 核心评估与拦截
+    # ------------------------------------------------------------
+    def _evaluate_process(self, proc_info: Dict, source: str = 'poll'):
+        """
+        评估进程风险并执行拦截。
+        1. 白名单检查 → 跳过
+        2. 黑名单匹配 → 终止 + 清理启动项 + 文件保护
+        3. 高安全级别下可疑进程检测 → 同上
+        """
         name = proc_info.get('name', '').lower()
-        exe = proc_info.get('exe', '').lower()
+        exe = proc_info.get('exe', '').lower() or name
+        pid = proc_info.get('pid', 0)
 
-        # 检查黑名单
-        blacklist = config.get('hips.blacklist', [])
-        for pattern in blacklist:
-            if pattern.lower() in name or pattern.lower() in exe:
-                logger.warning(f"HIPS阻止进程: {name} ({exe})")
-                return
-
-        # 检查白名单
+        # 白名单检查
         whitelist = config.get('hips.whitelist', [])
         for pattern in whitelist:
             if pattern.lower() in name or pattern.lower() in exe:
                 return
 
-        # 检测常见可疑进程
-        suspicious_names = [
-            'powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe',
-            'mshta.exe', 'rundll32.exe', 'regsvr32.exe',
-        ]
-        if name in suspicious_names:
+        matched = False
+        matched_reason = ''
+
+        # 黑名单检查
+        blacklist = config.get('hips.blacklist', [])
+        for pattern in blacklist:
+            if pattern.lower() in name or pattern.lower() in exe:
+                matched = True
+                matched_reason = f"黑名单匹配: {pattern}"
+                break
+
+        # 高安全级别下检测可疑进程
+        if not matched and self.level in ('high', 'paranoid'):
+            if name in self.SUSPICIOUS_NAMES:
+                try:
+                    import psutil
+                    proc = psutil.Process(pid)
+                    parent = proc.parent()
+                    parent_name = parent.name().lower() if parent else ''
+                    if parent_name not in ('explorer.exe', 'svchost.exe', 'services.exe', 'winlogon.exe'):
+                        matched = True
+                        matched_reason = f"可疑进程 {name} 由 {parent_name} 启动"
+                except Exception:
+                    pass
+
+        if matched:
+            self._intercepted += 1
+            logger.warning(f"HIPS 拦截: {matched_reason} (PID={pid}, name={name})")
+
+            # === 动作 1: 终止进程 ===
+            if pid > 0:
+                self._terminate_process(pid, name)
+
+            # === 动作 2: 清理注册表启动项 ===
+            self._remove_registry_run_keys(name, exe)
+
+            # === 动作 3: 文件系统保护 ===
+            if exe and os.path.exists(exe):
+                self._protect_file(exe)
+
+    # ------------------------------------------------------------
+    # 拦截动作实现
+    # ------------------------------------------------------------
+    def _terminate_process(self, pid: int, name: str):
+        """通过 OpenProcess + TerminateProcess 终止进程"""
+        handle = open_process(pid, PROCESS_TERMINATE | SYNCHRONIZE)
+        if handle:
             try:
-                proc = psutil.Process(proc_info['pid'])
-                parent = proc.parent()
-                if parent and parent.name().lower() not in ('explorer.exe', 'svchost.exe'):
-                    logger.warning(f"HIPS: 可疑进程 {name} 由 {parent.name()} 启动")
+                if terminate_process(handle):
+                    logger.warning(f"HIPS: 已终止进程 {name} (PID={pid})")
+                else:
+                    err = ctypes.WinError() if 'ctypes' in dir() else None
+                    logger.error(f"HIPS: 终止进程失败 {name} (PID={pid}): {err}")
+            finally:
+                close_handle(handle)
+        else:
+            logger.error(f"HIPS: 无法打开进程 {name} (PID={pid})，权限不足或进程已退出")
+
+    def _remove_registry_run_keys(self, name: str, exe: str):
+        """扫描 Run / RunOnce 键，删除指向恶意进程的条目"""
+        for hive, sub_key in self.RUN_KEY_PATHS:
+            try:
+                handle = open_reg_key(hive, sub_key, access=KEY_READ | KEY_SET_VALUE)
+                if handle is None:
+                    continue
+                try:
+                    values = enum_values(handle)
+                    for val_name, (val_type, val_data) in values.items():
+                        if not isinstance(val_data, str):
+                            continue
+                        val_lower = val_data.lower()
+                        if name.lower() in val_lower or (exe and exe.lower() in val_lower):
+                            if delete_value(handle, val_name):
+                                logger.warning(
+                                    f"HIPS: 已移除注册表启动项 "
+                                    f"{format_key_path(hive, sub_key)} -> {val_name}"
+                                )
+                finally:
+                    close_reg_key(handle)
             except Exception:
                 pass
+
+    def _protect_file(self, filepath: str):
+        """设置文件为只读属性以防止进一步损害"""
+        try:
+            if set_file_readonly(filepath):
+                logger.warning(f"HIPS: 已设置文件只读属性 {filepath}")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
+    def get_stats(self) -> Dict:
+        return {
+            'enabled': self.enabled,
+            'level': self.level,
+            'intercepted': self._intercepted,
+            'wmi_available': self._wmi_available,
+        }

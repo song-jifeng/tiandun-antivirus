@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 天盾 Antivirus - 防火墙引擎
+整合 Windows 防火墙 API (COM/netsh) 与规则匹配，实现真正的网络流量拦截
 """
 import os
 import sys
@@ -16,6 +17,16 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine.logger import logger
 from engine.config import config
+from engine.behavior.win_registry import (
+    kill_process, open_process, terminate_process, close_handle,
+    PROCESS_TERMINATE, SYNCHRONIZE,
+)
+from firewall.win_firewall_api import (
+    get_firewall_manager, WinFirewallManager,
+    HIGH_RISK_PORTS, FW_ACTION_BLOCK, FW_ACTION_ALLOW,
+    FW_DIRECTION_IN, FW_DIRECTION_OUT,
+    PROTOCOL_TCP, PROTOCOL_UDP, PROTOCOL_ANY,
+)
 
 
 class FirewallRule:
@@ -67,38 +78,69 @@ class FirewallRule:
 
 
 class FirewallEngine:
-    """防火墙引擎"""
+    """防火墙引擎 - 使用 Windows 防火墙 API 实现真实拦截"""
 
     def __init__(self):
         self._rules: List[FirewallRule] = []
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        self._fw_api: Optional[WinFirewallManager] = None
+        self._fw_rules_synced = False
         self._load_default_rules()
 
     def _load_default_rules(self):
-        """加载默认规则"""
+        """加载默认规则并同步到 Windows 防火墙"""
         self._rules = [
             FirewallRule('FW001', '允许本地回环', 'in', 'allow', 'any',
                         local_ip='127.0.0.1'),
             FirewallRule('FW002', '允许本地回环出站', 'out', 'allow', 'any',
                         local_ip='127.0.0.1'),
-            FirewallRule('FW003', '阻止高危端口入站', 'in', 'block', 'tcp',
+            FirewallRule('FW003', '阻止高危端口入站 (135/TCP)', 'in', 'block', 'tcp',
                         remote_port=135),
-            FirewallRule('FW004', '阻止高危端口入站', 'in', 'block', 'tcp',
+            FirewallRule('FW004', '阻止高危端口入站 (445/TCP)', 'in', 'block', 'tcp',
                         remote_port=445),
-            FirewallRule('FW005', '阻止高危端口入站', 'in', 'block', 'tcp',
+            FirewallRule('FW005', '阻止高危端口入站 (139/TCP)', 'in', 'block', 'tcp',
                         remote_port=139),
-            FirewallRule('FW006', '阻止高危端口入站', 'in', 'block', 'tcp',
+            FirewallRule('FW006', '阻止高危端口入站 (3389/TCP)', 'in', 'block', 'tcp',
                         remote_port=3389),
             FirewallRule('FW007', '阻止远程桌面暴力破解', 'in', 'block', 'tcp',
                         remote_port=3389, remote_ip='0.0.0.0/0'),
         ]
 
+    def _sync_to_windows_firewall(self):
+        """将内部规则同步到 Windows 防火墙"""
+        try:
+            self._fw_api = get_firewall_manager()
+            if not self._fw_api.available:
+                logger.warning("防火墙: Windows 防火墙 API 不可用，仅进行软件层规则匹配")
+                return
+
+            # 封锁高危端口
+            blocked = self._fw_api.block_high_risk_ports()
+            success_count = sum(1 for _, ok in blocked if ok)
+            logger.info(f"防火墙: 已同步 {success_count}/{len(blocked)} 条高危端口封锁规则到 Windows 防火墙")
+
+            # 同步软件规则中的端口封锁
+            with self._lock:
+                for rule in self._rules:
+                    if rule.action == 'block' and rule.remote_port > 0:
+                        proto = 'tcp' if rule.protocol == 'tcp' else 'udp'
+                        self._fw_api.block_port(rule.remote_port, proto, rule.direction)
+
+            self._fw_rules_synced = True
+            logger.info("防火墙: 规则同步完成")
+        except Exception as e:
+            logger.error(f"防火墙: 同步规则失败: {e}")
+
     def start(self):
         if self._running:
             return
         self._running = True
+
+        # 同步到 Windows 防火墙
+        self._sync_to_windows_firewall()
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         logger.info("防火墙引擎已启动")
@@ -110,12 +152,15 @@ class FirewallEngine:
         while self._running:
             try:
                 self._check_connections()
+                # 定期重新同步防火墙规则（每5分钟）
+                if self._fw_rules_synced and int(time.time()) % 300 < 10:
+                    self._sync_to_windows_firewall()
             except Exception:
                 pass
             time.sleep(10)
 
     def _check_connections(self):
-        """检查网络连接"""
+        """检查网络连接并匹配规则"""
         try:
             import psutil
             for conn in psutil.net_connections():
@@ -144,19 +189,68 @@ class FirewallEngine:
                                 logger.warning(
                                     f"防火墙阻止: {rule.name} - "
                                     f"{conn_info['remote_ip']}:{conn_info['remote_port']}"
+                                    f" (PID={conn_info['pid']})"
                                 )
+
+                            # 尝试终止发起连接的进程
+                            if conn.pid and conn.pid > 0:
+                                self._terminate_connection_process(conn.pid, conn_info)
         except ImportError:
             pass
         except Exception:
             pass
 
+    def _terminate_connection_process(self, pid: int, conn_info: Dict):
+        """终止发起恶意连接的进程"""
+        handle = open_process(pid, PROCESS_TERMINATE | SYNCHRONIZE)
+        if handle:
+            try:
+                if terminate_process(handle):
+                    logger.warning(
+                        f"防火墙: 已终止恶意连接进程 PID={pid} "
+                        f"({conn_info.get('remote_ip', '')}:{conn_info.get('remote_port', '')})"
+                    )
+            finally:
+                close_handle(handle)
+
+    # ------------------------------------------------------------
+    # 规则管理
+    # ------------------------------------------------------------
     def add_rule(self, rule: FirewallRule):
+        """添加规则，同时同步到 Windows 防火墙"""
         with self._lock:
             self._rules.append(rule)
 
+        # 同步到 Windows 防火墙
+        if self._fw_api and self._fw_api.available:
+            try:
+                if rule.action == 'block':
+                    if rule.remote_port > 0:
+                        proto = 'tcp' if rule.protocol == 'tcp' else 'udp'
+                        self._fw_api.block_port(rule.remote_port, proto, rule.direction)
+                    elif rule.program_path != '*':
+                        self._fw_api.block_program(rule.program_path)
+            except Exception:
+                pass
+
     def remove_rule(self, rule_id: str):
+        """删除规则"""
+        rule_to_remove = None
         with self._lock:
+            for rule in self._rules:
+                if rule.id == rule_id:
+                    rule_to_remove = rule
+                    break
             self._rules = [r for r in self._rules if r.id != rule_id]
+
+        # 从 Windows 防火墙移除
+        if rule_to_remove and self._fw_api and self._fw_api.available:
+            try:
+                if rule_to_remove.remote_port > 0:
+                    proto = 'tcp' if rule_to_remove.protocol == 'tcp' else 'udp'
+                    self._fw_api.unblock_port(rule_to_remove.remote_port, proto, rule_to_remove.direction)
+            except Exception:
+                pass
 
     def get_rules(self) -> List[Dict]:
         with self._lock:
@@ -170,6 +264,8 @@ class FirewallEngine:
                 'enabled_rules': sum(1 for r in self._rules if r.enabled),
                 'total_hits': total_hits,
                 'blocked_connections': total_hits,
+                'windows_firewall_available': self._fw_api.available if self._fw_api else False,
+                'windows_rules_synced': self._fw_rules_synced,
             }
 
 
@@ -202,6 +298,20 @@ class IntrusionDetection:
         # 60秒内超过20个连接 = 端口扫描
         if len(self._connection_log[src_ip]) > 20:
             logger.warning(f"检测到端口扫描: {src_ip}")
+            # 尝试通过 Windows 防火墙封锁该 IP
+            try:
+                fw = get_firewall_manager()
+                if fw.available:
+                    rule_name = f"Tiandun_Block_Scan_{src_ip.replace('.', '_')}"
+                    fw.add_rule(
+                        rule_name=rule_name,
+                        description=f"天盾入侵检测 - 封锁扫描源 {src_ip}",
+                        direction='in', action='block',
+                        protocol='any', remote_ip=src_ip,
+                    )
+                    logger.warning(f"入侵检测: 已封锁扫描源 IP {src_ip}")
+            except Exception:
+                pass
             return True
 
         return False

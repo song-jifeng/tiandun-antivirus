@@ -33,3 +33,7 @@ quarantine/
 test_output.txt
 config.user.json
 test_eicar.txt
+
+# Generated cache
+cache/
+tools/fetched_hashes.json

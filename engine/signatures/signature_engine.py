@@ -127,8 +127,8 @@ class BytePattern:
         for i in range(search_start, search_end):
             found = True
             for j in range(pattern_len):
-                if self._mask[j] == 0xFF:
-                    continue
+                if self._mask[j] == 0x00:
+                    continue  # 通配符，跳过比较
                 if data[i + j] != self._compiled[j]:
                     found = False
                     break

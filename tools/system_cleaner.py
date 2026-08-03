@@ -17,8 +17,13 @@ class SystemCleaner:
     """系统清理器"""
 
     @staticmethod
-    def clean_temp_files() -> Dict:
-        """清理临时文件"""
+    def clean_temp_files(dry_run: bool = False, max_files: int = 500) -> Dict:
+        """清理临时文件
+
+        Args:
+            dry_run: 如果为 True，只统计不删除
+            max_files: 最大处理文件数，防止长时间挂起
+        """
         cleaned = 0
         freed_bytes = 0
         errors = []
@@ -33,23 +38,40 @@ class SystemCleaner:
         for temp_dir in temp_dirs:
             if not temp_dir or not os.path.exists(temp_dir):
                 continue
+            if cleaned >= max_files:
+                break
             try:
-                for root, dirs, files in os.walk(temp_dir):
-                    for f in files:
-                        try:
-                            fpath = os.path.join(root, f)
-                            size = os.path.getsize(fpath)
-                            os.remove(fpath)
+                # 使用 scandir 代替 os.walk 以提高性能
+                for entry in os.scandir(temp_dir):
+                    if cleaned >= max_files:
+                        break
+                    try:
+                        if entry.is_file():
+                            size = entry.stat().st_size
+                            if not dry_run:
+                                os.remove(entry.path)
                             cleaned += 1
                             freed_bytes += size
-                        except Exception:
-                            pass
-                    for d in dirs:
-                        try:
-                            dpath = os.path.join(root, d)
-                            shutil.rmtree(dpath, ignore_errors=True)
-                        except Exception:
-                            pass
+                        elif entry.is_dir():
+                            # 只清理一层深度的目录
+                            try:
+                                for sub_entry in os.scandir(entry.path):
+                                    if cleaned >= max_files:
+                                        break
+                                    if sub_entry.is_file():
+                                        size = sub_entry.stat().st_size
+                                        if not dry_run:
+                                            os.remove(sub_entry.path)
+                                        cleaned += 1
+                                        freed_bytes += size
+                                    elif sub_entry.is_dir():
+                                        if not dry_run:
+                                            shutil.rmtree(sub_entry.path, ignore_errors=True)
+                                        cleaned += 1
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             except Exception as e:
                 errors.append(str(e))
 

@@ -116,7 +116,7 @@ class GenericAnalyzer:
 
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
-        self._max_scan_size = config.get('max_scan_size', 50 * 1024 * 1024)  # 50MB
+        self._max_scan_size = self.config.get('max_scan_size', 50 * 1024 * 1024)  # 50MB
 
     def analyze(self, filepath: str) -> Tuple[float, List[str], Dict[str, Any]]:
         """
