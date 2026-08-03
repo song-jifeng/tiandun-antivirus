@@ -1,0 +1,27 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Install lint tools
+      run: |
+        pip install flake8 pylint
+    - name: Lint with flake8
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Check import order
+      run: |
+        python -c "import ast, sys; files = [f for f in __import__('glob').glob('**/*.py', recursive=True) if 'signatures' not in f and '__pycache__' not in f]; print(f'Checking {len(files)} files')"

@@ -194,7 +194,7 @@ class TestConfigManagerExtended(unittest.TestCase):
         self.assertTrue(self.config.get('realtime.file_monitor'))
         self.assertEqual(self.config.get('scan.thread_count'), 4)
         self.assertEqual(self.config.get('scan.max_file_size_mb'), 200)
-        self.assertEqual(self.config.get('cloud.cache_size'), 10000)
+        self.assertEqual(self.config.get('cloud.cache_size'), 50000)
 
     def test_nested_set_get(self):
         self.config.set('test.nested.deep.value', 42)

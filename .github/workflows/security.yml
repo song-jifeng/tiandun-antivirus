@@ -1,0 +1,25 @@
+name: Security Scan
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6:00 UTC
+  workflow_dispatch:
+
+jobs:
+  security:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Install bandit
+      run: pip install bandit
+    - name: Run bandit
+      run: |
+        bandit -r . -f json -o bandit-report.json || true
+    - name: Check for secrets
+      run: |
+        pip install truffleHog
+        trufflehog --no-update file://. 2>&1 || true

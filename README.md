@@ -3,6 +3,12 @@
 > 全方位安全防护软件 — 基于 Python 的多维度杀毒引擎
 > 开源协议：MIT License
 
+## CI/CD Status
+
+![Tests](https://github.com/song-jifeng/tiandun-antivirus/actions/workflows/tests.yml/badge.svg)
+![Code Quality](https://github.com/song-jifeng/tiandun-antivirus/actions/workflows/lint.yml/badge.svg)
+![Build](https://github.com/song-jifeng/tiandun-antivirus/actions/workflows/build.yml/badge.svg)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
 [![Code size](https://img.shields.io/badge/Code-500K%2B%20lines-brightgreen.svg)](.)

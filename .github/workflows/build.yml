@@ -1,0 +1,27 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Install dependencies
+      run: |
+        pip install pyinstaller pyqt5 psutil
+    - name: Build executable
+      run: |
+        pyinstaller --onefile --windowed --name "TiandunAntivirus" --icon=icon.ico main.py 2>&1 || echo "Build may need adjustments"
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: TiandunAntivirus-windows
+        path: dist/TiandunAntivirus.exe

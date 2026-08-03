@@ -31,11 +31,16 @@
     },
     "cloud": {
         "enabled": true,
-        "timeout_seconds": 10,
-        "cache_size": 10000,
-        "cache_ttl_hours": 24,
+        "timeout_seconds": 15,
+        "cache_size": 50000,
+        "cache_ttl_hours": 48,
         "offline_mode": false,
-        "privacy_mode": true
+        "privacy_mode": true,
+        "malware_bazaar_enabled": true,
+        "malware_bazaar_timeout": 10,
+        "virustotal_enabled": false,
+        "virustotal_api_key": "",
+        "local_fallback": true
     },
     "hips": {
         "enabled": true,

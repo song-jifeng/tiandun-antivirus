@@ -93,14 +93,16 @@ DEFAULT_CONFIG = {
     # ============================================================
     'cloud': {
         'enabled': True,               # 云查杀总开关
-        'server_url': 'https://cloud.tiandun.security/api/scan',
-        'timeout_seconds': 10,
-        'cache_size': 10000,           # 缓存条目数
-        'cache_ttl_hours': 24,
+        'timeout_seconds': 15,
+        'cache_size': 50000,           # 缓存条目数
+        'cache_ttl_hours': 48,
         'offline_mode': False,         # 离线模式
         'privacy_mode': True,          # 隐私模式(不发送文件内容)
-        'send_hash_only': True,        # 仅发送哈希值
-        'max_retries': 3,
+        'malware_bazaar_enabled': True,  # MalwareBazaar 主后端
+        'malware_bazaar_timeout': 10,    # MalwareBazaar 超时(秒)
+        'virustotal_enabled': False,    # VirusTotal 支持(需要 API Key)
+        'virustotal_api_key': '',       # VirusTotal API Key
+        'local_fallback': True,         # 本地启发式回退
     },
 
     # ============================================================

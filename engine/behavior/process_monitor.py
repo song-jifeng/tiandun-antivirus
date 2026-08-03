@@ -638,8 +638,14 @@ class ProcessMonitor:
         self._events: List[ProcessEvent] = []
         self._event_queue: deque = deque(maxlen=10000)
 
-        # 轮询间隔 (秒)
-        self._poll_interval = config.get('realtime.monitor_level', 'normal') == 'high' and 1 or 2
+        # 轮询间隔 (秒) - WMI 实时事件驱动为主，轮询降为 5s 后备
+        self._poll_interval = 5
+
+        # WMI 实时进程监控
+        self._wmi_available = False
+        self._wmi_thread: Optional[threading.Thread] = None
+        self._wmi_start_watcher = None
+        self._wmi_stop_watcher = None
 
         # 统计
         self.stats = {
@@ -671,12 +677,243 @@ class ProcessMonitor:
         self._take_snapshot()  # 初始快照
         self._thread = threading.Thread(target=self._monitor_loop, name='ProcessMonitor', daemon=True)
         self._thread.start()
-        logger.info("ProcessMonitor 已启动 (轮询间隔: %ds)", self._poll_interval)
+        # 尝试启动 WMI 实时进程监控
+        self._try_start_wmi_monitor()
+        logger.info("ProcessMonitor 已启动 (轮询间隔: %ds, WMI=%s)", self._poll_interval, self._wmi_available)
 
     def stop(self):
         """停止进程监控"""
         self._running = False
+        if self._wmi_thread:
+            self._wmi_thread.join(timeout=3)
+            self._wmi_thread = None
         logger.info("ProcessMonitor 已停止，共处理事件: %d", self.stats['total_events'])
+
+    # ============================================================
+    # WMI 实时进程监控（事件驱动）
+    # ============================================================
+    def _try_start_wmi_monitor(self):
+        """
+        尝试使用 WMI 事件订阅实时进程创建/终止。
+        优先使用 wmi 模块，回退到 win32com.client。
+        """
+        # --- 尝试 wmi 模块 ---
+        try:
+            import wmi  # type: ignore
+            self._wmi_conn = wmi.WMI()
+            self._wmi_start_watcher = self._wmi_conn.WatchFor(
+                notification_type="Creation",
+                wmi_class="Win32_ProcessStartTrace",
+            )
+            self._wmi_stop_watcher = self._wmi_conn.WatchFor(
+                notification_type="Creation",
+                wmi_class="Win32_ProcessStopTrace",
+            )
+            self._wmi_available = True
+            logger.info("ProcessMonitor: WMI(wmi) 实时进程监控已启动")
+        except ImportError:
+            self._try_start_wmi_com()
+        except Exception as e:
+            logger.debug("ProcessMonitor: WMI(wmi) 不可用: %s", e)
+            self._try_start_wmi_com()
+
+        if self._wmi_available:
+            self._wmi_thread = threading.Thread(
+                target=self._wmi_monitor_loop, name='WMI-ProcessMonitor', daemon=True
+            )
+            self._wmi_thread.start()
+        else:
+            logger.warning("ProcessMonitor: WMI 不可用，使用轮询模式 (间隔: %ds)", self._poll_interval)
+
+    def _try_start_wmi_com(self):
+        """回退方案：使用 win32com.client 订阅 WMI 事件"""
+        try:
+            import win32com.client  # type: ignore
+            import pythoncom  # type: ignore
+            pythoncom.CoInitialize()
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", "root\\cimv2")
+            self._wmi_start_events = service.ExecNotificationQuery(
+                "SELECT * FROM Win32_ProcessStartTrace"
+            )
+            self._wmi_stop_events = service.ExecNotificationQuery(
+                "SELECT * FROM Win32_ProcessStopTrace"
+            )
+            self._wmi_available = True
+            logger.info("ProcessMonitor: WMI(win32com) 实时进程监控已启动")
+        except ImportError:
+            self._wmi_available = False
+        except Exception as e:
+            self._wmi_available = False
+            logger.debug("ProcessMonitor: WMI(win32com) 不可用: %s", e)
+
+    def _wmi_monitor_loop(self):
+        """WMI 事件循环 — 等待进程创建/终止事件"""
+        if self._wmi_start_watcher is not None:
+            # wmi 模块模式
+            self._wmi_monitor_loop_wmi()
+        elif hasattr(self, '_wmi_start_events'):
+            # win32com 模式
+            self._wmi_monitor_loop_com()
+
+    def _wmi_monitor_loop_wmi(self):
+        """wmi 模块事件循环"""
+        import pythoncom  # type: ignore
+        pythoncom.CoInitialize()
+        while self._running and self._wmi_available:
+            try:
+                # 等待进程创建事件 (带 1s 超时)
+                start_event = self._wmi_start_watcher(timeout_ms=1000)
+                if start_event is not None:
+                    self._wmi_on_process_start({
+                        'pid': start_event.ProcessID,
+                        'name': start_event.ProcessName,
+                        'exe': getattr(start_event, 'ProcessName', ''),
+                    })
+            except Exception:
+                pass
+
+            try:
+                # 等待进程终止事件 (带 1s 超时)
+                stop_event = self._wmi_stop_watcher(timeout_ms=1000)
+                if stop_event is not None:
+                    self._wmi_on_process_stop({
+                        'pid': stop_event.ProcessID,
+                        'name': stop_event.ProcessName,
+                        'exe': getattr(stop_event, 'ProcessName', ''),
+                    })
+            except Exception:
+                pass
+
+    def _wmi_monitor_loop_com(self):
+        """win32com 事件循环"""
+        import pythoncom  # type: ignore
+        pythoncom.CoInitialize()
+        while self._running and self._wmi_available:
+            try:
+                # 进程创建事件 (1000ms 超时)
+                event = self._wmi_start_events.NextEvent(1000)
+                if event is not None:
+                    self._wmi_on_process_start({
+                        'pid': event.ProcessID,
+                        'name': event.ProcessName,
+                        'exe': getattr(event, 'ProcessName', ''),
+                    })
+            except Exception:
+                pass
+
+            try:
+                # 进程终止事件 (1000ms 超时)
+                event = self._wmi_stop_events.NextEvent(1000)
+                if event is not None:
+                    self._wmi_on_process_stop({
+                        'pid': event.ProcessID,
+                        'name': event.ProcessName,
+                        'exe': getattr(event, 'ProcessName', ''),
+                    })
+            except Exception:
+                pass
+
+    def _wmi_on_process_start(self, proc_info: Dict):
+        """处理 WMI 进程创建事件"""
+        pid = proc_info.get('pid', 0)
+        if pid <= 0:
+            return
+
+        # 检查是否已通过轮询处理过
+        if pid in self._known_processes:
+            return
+
+        name = proc_info.get('name', '')
+        exe = proc_info.get('exe', '') or ''
+
+        # 获取更多进程信息
+        ppid = 0
+        cmdline = ''
+        username = ''
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            ppid = proc.ppid()
+            cmdline = ' '.join(proc.cmdline()) if proc.cmdline() else ''
+            username = proc.username() or ''
+            if not exe:
+                exe = proc.exe() or ''
+        except Exception:
+            pass
+
+        # 获取父进程信息
+        parent_name = ''
+        parent_path = ''
+        if ppid > 0:
+            parent_info = self._parent_cache.get(ppid, {})
+            if parent_info:
+                parent_name = parent_info.get('name', '')
+                parent_path = parent_info.get('exe', '') or ''
+            else:
+                try:
+                    import psutil
+                    parent = psutil.Process(ppid)
+                    parent_name = parent.name() or ''
+                    parent_path = parent.exe() or ''
+                except Exception:
+                    pass
+
+        event = ProcessEvent(
+            event_type='start',
+            pid=pid,
+            ppid=ppid,
+            process_name=name,
+            process_path=exe,
+            command_line=cmdline,
+            username=username,
+            parent_name=parent_name,
+            parent_path=parent_path,
+            details={
+                'source': 'wmi',
+                'create_time': time.time(),
+            }
+        )
+
+        self.add_event(event)
+        self.stats['processes_started'] += 1
+
+        # 更新缓存
+        self._known_processes.add(pid)
+        if ppid > 0:
+            self._parent_cache[ppid] = {
+                'name': parent_name or 'unknown',
+                'exe': parent_path or '',
+            }
+
+        # 运行规则检测
+        self._run_detection(event)
+
+    def _wmi_on_process_stop(self, proc_info: Dict):
+        """处理 WMI 进程终止事件"""
+        pid = proc_info.get('pid', 0)
+        if pid <= 0:
+            return
+
+        name = proc_info.get('name', '')
+        exe = proc_info.get('exe', '') or ''
+
+        event = ProcessEvent(
+            event_type='terminate',
+            pid=pid,
+            ppid=0,
+            process_name=name,
+            process_path=exe,
+            details={
+                'source': 'wmi',
+                'terminated_by': '',
+            }
+        )
+
+        self.add_event(event)
+        self.stats['processes_terminated'] += 1
+        self._known_processes.discard(pid)
+        self._run_detection(event)
 
     def is_running(self) -> bool:
         return self._running
@@ -1025,6 +1262,7 @@ class ProcessMonitor:
             'rules_enabled': len(self._enabled_rules),
             'rules_count': len(ALL_PROCESS_RULES),
             'poll_interval': self._poll_interval,
+            'wmi_available': self._wmi_available,
         }
 
     def get_rules_summary(self) -> List[Dict]:

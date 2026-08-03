@@ -16,13 +16,13 @@ from PyQt5.QtWidgets import (
     QLabel, QStackedWidget, QFrame, QListWidget, QListWidgetItem,
     QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
-    QCheckBox, QComboBox, QLineEdit, QTextEdit, QGroupBox,
+    QCheckBox, QComboBox, QDateEdit, QLineEdit, QTextEdit, QGroupBox,
     QTabWidget, QSplitter, QScrollArea, QFileDialog, QButtonGroup,
     QRadioButton, QSizePolicy, QSpacerItem, QSlider, QSpinBox,
     QStyleFactory, QGridLayout, QFormLayout
 )
 from PyQt5.QtCore import (
-    Qt, QTimer, pyqtSignal, QThread, QSize, QPropertyAnimation,
+    QDate, Qt, QTimer, pyqtSignal, QThread, QSize, QPropertyAnimation,
     QEasingCurve, QRect, QPoint, QMutex
 )
 from PyQt5.QtGui import (
@@ -38,6 +38,8 @@ from engine.config import config
 from scanner import scanner
 from notifier import notifier
 from updater import updater
+
+from cleanup.quarantine import QuarantineManager
 
 from .styles import Colors, Fonts, LIGHT_STYLE, DARK_STYLE, get_style
 
@@ -158,6 +160,9 @@ class MainWindow(QMainWindow):
         self._is_dark = self._current_theme == 'dark'
         self._scan_worker = None
         self._protection_enabled = config.get('realtime.enabled', True)
+
+        # 隔离区管理器
+        self.quarantine_mgr = QuarantineManager()
 
         # 初始化UI
         self._init_ui()
@@ -282,8 +287,8 @@ class MainWindow(QMainWindow):
         self.pages.append(self._create_realtime_page())
         self.pages.append(self._create_firewall_page())
         # 隔离区、日志、设置页面
-        self.pages.append(self._create_placeholder_page('📦 隔离区', '隔离区管理功能'))
-        self.pages.append(self._create_placeholder_page('📋 日志', '日志查看功能'))
+        self.pages.append(self._create_quarantine_page())
+        self.pages.append(self._create_log_page())
         self.pages.append(self._create_settings_page())
 
         for page in self.pages:
@@ -908,6 +913,758 @@ class MainWindow(QMainWindow):
         return page
 
     # ============================================================
+    # 隔离区页面方法
+    # ============================================================
+    def _create_quarantine_page(self) -> QWidget:
+        """创建隔离区管理页面"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setSpacing(16)
+
+        # 标题栏
+        title_bar = QHBoxLayout()
+        title_label = QLabel('📦 隔离区管理')
+        title_label.setFont(Fonts.HEADING)
+        title_bar.addWidget(title_label)
+        title_bar.addStretch()
+
+        refresh_btn = QPushButton('🔄 刷新')
+        refresh_btn.setObjectName('btnSecondary')
+        refresh_btn.setFixedSize(100, 36)
+        refresh_btn.clicked.connect(self._refresh_quarantine)
+        title_bar.addWidget(refresh_btn)
+        layout.addLayout(title_bar)
+
+        # 分割器 - 表格 + 详情面板
+        splitter = QSplitter(Qt.Horizontal)
+
+        # 表格容器
+        table_container = QWidget()
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.quarantine_table = QTableWidget()
+        self.quarantine_table.setColumnCount(6)
+        self.quarantine_table.setHorizontalHeaderLabels(['原始路径', '文件名', '隔离日期', '大小', '威胁名称', '状态'])
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.quarantine_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.quarantine_table.verticalHeader().setVisible(False)
+        self.quarantine_table.setAlternatingRowColors(True)
+        self.quarantine_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.quarantine_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.quarantine_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.quarantine_table.customContextMenuRequested.connect(self._show_quarantine_context_menu)
+        self.quarantine_table.itemSelectionChanged.connect(self._on_quarantine_selection_changed)
+        self.quarantine_table.setSortingEnabled(True)
+        table_layout.addWidget(self.quarantine_table)
+
+        splitter.addWidget(table_container)
+
+        # 详情面板
+        self.quarantine_details_panel = QFrame()
+        self.quarantine_details_panel.setObjectName('card')
+        self.quarantine_details_panel.setFixedWidth(300)
+        details_layout = QVBoxLayout(self.quarantine_details_panel)
+
+        details_header = QHBoxLayout()
+        details_title = QLabel('详细信息')
+        details_title.setFont(Fonts.SUBHEADING)
+        details_header.addWidget(details_title)
+        details_header.addStretch()
+
+        close_details_btn = QPushButton('✕')
+        close_details_btn.setFixedSize(28, 28)
+        close_details_btn.setObjectName('btnSecondary')
+        close_details_btn.clicked.connect(lambda: self.quarantine_details_panel.setVisible(False))
+        details_header.addWidget(close_details_btn)
+        details_layout.addLayout(details_header)
+
+        # 详情字段
+        self.detail_labels = {}
+        detail_fields = [
+            ('original_path', '原始路径'),
+            ('file_name', '文件名'),
+            ('md5', 'MD5'),
+            ('sha256', 'SHA256'),
+            ('threat_name', '威胁名称'),
+            ('threat_type', '威胁类型'),
+            ('threat_level', '威胁等级'),
+            ('quarantine_time', '隔离时间'),
+            ('file_size', '文件大小'),
+            ('scan_engine', '扫描引擎'),
+            ('status', '状态'),
+        ]
+
+        for key, label in detail_fields:
+            row = QHBoxLayout()
+            name_label = QLabel(f'{label}:')
+            name_label.setStyleSheet('color: #5f6368; font-size: 12px;')
+            name_label.setFixedWidth(80)
+            row.addWidget(name_label)
+
+            value_label = QLabel('-')
+            value_label.setWordWrap(True)
+            value_label.setStyleSheet('font-size: 12px;')
+            row.addWidget(value_label, 1)
+            details_layout.addLayout(row)
+            self.detail_labels[key] = value_label
+
+        details_layout.addStretch()
+
+        # 详情面板操作按钮
+        self.detail_restore_btn = QPushButton('↩️ 恢复文件')
+        self.detail_restore_btn.setObjectName('btnSuccess')
+        self.detail_restore_btn.clicked.connect(self._restore_selected)
+        details_layout.addWidget(self.detail_restore_btn)
+
+        self.detail_delete_btn = QPushButton('🗑️ 永久删除')
+        self.detail_delete_btn.setObjectName('btnDanger')
+        self.detail_delete_btn.clicked.connect(self._delete_selected)
+        details_layout.addWidget(self.detail_delete_btn)
+
+        self.quarantine_details_panel.setVisible(False)
+        splitter.addWidget(self.quarantine_details_panel)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+        # 底部操作栏
+        action_bar = QHBoxLayout()
+
+        self.q_restore_btn = QPushButton('↩️ 恢复选中')
+        self.q_restore_btn.setObjectName('btnSuccess')
+        self.q_restore_btn.setFixedSize(120, 36)
+        self.q_restore_btn.clicked.connect(self._restore_selected)
+        action_bar.addWidget(self.q_restore_btn)
+
+        self.q_delete_btn = QPushButton('🗑️ 永久删除')
+        self.q_delete_btn.setObjectName('btnDanger')
+        self.q_delete_btn.setFixedSize(120, 36)
+        self.q_delete_btn.clicked.connect(self._delete_selected)
+        action_bar.addWidget(self.q_delete_btn)
+
+        empty_btn = QPushButton('清空隔离区')
+        empty_btn.setObjectName('btnDanger')
+        empty_btn.setFixedSize(120, 36)
+        empty_btn.clicked.connect(self._empty_quarantine)
+        action_bar.addWidget(empty_btn)
+
+        action_bar.addStretch()
+
+        self.quarantine_status_label = QLabel('共 0 项，总大小 0 B')
+        self.quarantine_status_label.setStyleSheet('color: #5f6368; font-size: 12px;')
+        action_bar.addWidget(self.quarantine_status_label)
+
+        layout.addLayout(action_bar)
+
+        return page
+
+    def _refresh_quarantine(self):
+        """刷新隔离区列表"""
+        try:
+            items = self.quarantine_mgr.get_all()
+            self.quarantine_table.setRowCount(0)
+
+            total_size = 0
+            for item in items:
+                row = self.quarantine_table.rowCount()
+                self.quarantine_table.insertRow(row)
+
+                # 原始路径
+                path_item = QTableWidgetItem(item.get('original_path', ''))
+                path_item.setData(Qt.UserRole, item.get('id', ''))
+                self.quarantine_table.setItem(row, 0, path_item)
+                # 文件名
+                self.quarantine_table.setItem(row, 1, QTableWidgetItem(item.get('file_name', '')))
+                # 隔离日期
+                q_time = item.get('quarantine_time', 0)
+                date_str = datetime.fromtimestamp(q_time).strftime('%Y-%m-%d %H:%M:%S') if q_time else '-'
+                self.quarantine_table.setItem(row, 2, QTableWidgetItem(date_str))
+                # 大小
+                size = item.get('file_size', 0)
+                total_size += size
+                self.quarantine_table.setItem(row, 3, QTableWidgetItem(self._format_size(size)))
+                # 威胁名称
+                threat_name = item.get('threat_name', '') or '-'
+                self.quarantine_table.setItem(row, 4, QTableWidgetItem(threat_name))
+                # 状态
+                status = '已恢复' if item.get('restored') else '已隔离'
+                status_item = QTableWidgetItem(status)
+                if item.get('restored'):
+                    status_item.setForeground(QColor('#34a853'))
+                else:
+                    status_item.setForeground(QColor('#ea4335'))
+                self.quarantine_table.setItem(row, 5, status_item)
+
+            # 更新状态
+            count = len(items)
+            self.quarantine_status_label.setText(f'共 {count} 项，总大小 {self._format_size(total_size)}')
+
+            # 更新仪表盘统计
+            self._update_stats()
+
+        except Exception as e:
+            logger.error(f"刷新隔离区失败: {e}")
+
+    def _show_quarantine_context_menu(self, pos):
+        """显示右键菜单"""
+        item = self.quarantine_table.itemAt(pos)
+        if not item:
+            return
+
+        menu = QMenu()
+
+        restore_action = QAction('↩️ 恢复文件', self)
+        restore_action.triggered.connect(self._restore_selected)
+        menu.addAction(restore_action)
+
+        delete_action = QAction('🗑️ 永久删除', self)
+        delete_action.triggered.connect(self._delete_selected)
+        menu.addAction(delete_action)
+
+        menu.addSeparator()
+
+        details_action = QAction('📋 查看详情', self)
+        details_action.triggered.connect(self._show_quarantine_details)
+        menu.addAction(details_action)
+
+        menu.exec_(self.quarantine_table.viewport().mapToGlobal(pos))
+
+    def _on_quarantine_selection_changed(self):
+        """隔离区选择变化"""
+        selected = self._get_selected_quarantine_ids()
+        has_selection = len(selected) > 0
+        single_selection = len(selected) == 1
+
+        self.q_restore_btn.setEnabled(has_selection)
+        self.q_delete_btn.setEnabled(has_selection)
+        self.detail_restore_btn.setEnabled(has_selection)
+        self.detail_delete_btn.setEnabled(has_selection)
+
+        if single_selection:
+            self._update_quarantine_details(selected[0])
+            self.quarantine_details_panel.setVisible(True)
+        else:
+            self.quarantine_details_panel.setVisible(False)
+
+    def _update_quarantine_details(self, qid: str):
+        """更新隔离区详情面板"""
+        try:
+            items = self.quarantine_mgr.get_all()
+            info = None
+            for i in items:
+                if i.get('id') == qid:
+                    info = i
+                    break
+
+            if info:
+                self.detail_labels['original_path'].setText(info.get('original_path', '-'))
+                self.detail_labels['file_name'].setText(info.get('file_name', '-'))
+                md5_val = info.get('md5', '-')
+                self.detail_labels['md5'].setText(md5_val[:32] + '...' if len(md5_val) > 32 else md5_val)
+                sha256_val = info.get('sha256', '-')
+                self.detail_labels['sha256'].setText(sha256_val[:16] + '...' if len(sha256_val) > 16 else sha256_val)
+                self.detail_labels['threat_name'].setText(info.get('threat_name', '-') or '-')
+                self.detail_labels['threat_type'].setText(info.get('threat_type', '-') or '-')
+                level = info.get('threat_level', 0)
+                level_names = {5: '严重', 4: '高危', 3: '中等', 2: '低危', 1: '信息', 0: '未知'}
+                self.detail_labels['threat_level'].setText(level_names.get(level, '未知'))
+                q_time = info.get('quarantine_time', 0)
+                date_str = datetime.fromtimestamp(q_time).strftime('%Y-%m-%d %H:%M:%S') if q_time else '-'
+                self.detail_labels['quarantine_time'].setText(date_str)
+                self.detail_labels['file_size'].setText(self._format_size(info.get('file_size', 0)))
+                self.detail_labels['scan_engine'].setText(info.get('scan_engine', '-') or '-')
+                status = '已恢复' if info.get('restored') else '已隔离'
+                self.detail_labels['status'].setText(status)
+        except Exception as e:
+            logger.error(f"更新隔离详情失败: {e}")
+
+    def _get_selected_quarantine_ids(self) -> list:
+        """获取选中行的隔离ID列表"""
+        ids = []
+        for item in self.quarantine_table.selectedItems():
+            if item.column() == 0:
+                qid = item.data(Qt.UserRole)
+                if qid:
+                    ids.append(qid)
+        return list(set(ids))
+
+    def _restore_selected(self):
+        """恢复选中文件"""
+        ids = self._get_selected_quarantine_ids()
+        if not ids:
+            QMessageBox.information(self, '提示', '请先选择要恢复的文件')
+            return
+
+        reply = QMessageBox.question(
+            self, '确认恢复',
+            f'确定要恢复选中的 {len(ids)} 个文件吗？\n文件将恢复到原始路径。',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        success = 0
+        for qid in ids:
+            if self.quarantine_mgr.restore(qid):
+                success += 1
+
+        QMessageBox.information(self, '恢复结果', f'成功恢复 {success}/{len(ids)} 个文件')
+        self._refresh_quarantine()
+
+    def _delete_selected(self):
+        """永久删除选中文件"""
+        ids = self._get_selected_quarantine_ids()
+        if not ids:
+            QMessageBox.information(self, '提示', '请先选择要删除的文件')
+            return
+
+        reply = QMessageBox.warning(
+            self, '确认删除',
+            f'确定要永久删除选中的 {len(ids)} 个文件吗？\n此操作不可恢复！',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        success = 0
+        for qid in ids:
+            if self.quarantine_mgr.delete(qid):
+                success += 1
+
+        QMessageBox.information(self, '删除结果', f'成功删除 {success}/{len(ids)} 个文件')
+        self._refresh_quarantine()
+
+    def _empty_quarantine(self):
+        """清空隔离区"""
+        items = self.quarantine_mgr.get_all()
+        if not items:
+            QMessageBox.information(self, '提示', '隔离区已为空')
+            return
+
+        reply = QMessageBox.warning(
+            self, '确认清空',
+            f'确定要清空隔离区吗？\n将永久删除所有 {len(items)} 个隔离文件！\n此操作不可恢复！',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        success = 0
+        for item in items:
+            if self.quarantine_mgr.delete(item.get('id', '')):
+                success += 1
+
+        QMessageBox.information(self, '清空结果', f'成功清空 {success}/{len(items)} 个文件')
+        self._refresh_quarantine()
+
+    def _show_quarantine_details(self):
+        """显示详情（通过右键菜单）"""
+        ids = self._get_selected_quarantine_ids()
+        if len(ids) == 1:
+            self._update_quarantine_details(ids[0])
+            self.quarantine_details_panel.setVisible(True)
+
+    # ============================================================
+    # 日志页面方法
+    # ============================================================
+    def _create_log_page(self) -> QWidget:
+        """创建日志查看页面"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setSpacing(12)
+
+        # 标题栏
+        title_bar = QHBoxLayout()
+        title_label = QLabel('📋 日志查看')
+        title_label.setFont(Fonts.HEADING)
+        title_bar.addWidget(title_label)
+        title_bar.addStretch()
+
+        export_btn = QPushButton('📥 导出')
+        export_btn.setObjectName('btnSecondary')
+        export_btn.setFixedSize(80, 36)
+        export_btn.clicked.connect(self._export_logs)
+        title_bar.addWidget(export_btn)
+
+        refresh_btn = QPushButton('🔄 刷新')
+        refresh_btn.setObjectName('btnSecondary')
+        refresh_btn.setFixedSize(80, 36)
+        refresh_btn.clicked.connect(self._refresh_logs)
+        title_bar.addWidget(refresh_btn)
+        layout.addLayout(title_bar)
+
+        # 筛选栏
+        filter_bar = QFrame()
+        filter_bar.setObjectName('card')
+        filter_layout = QVBoxLayout(filter_bar)
+        filter_layout.setSpacing(8)
+
+        # 第一行：级别筛选
+        level_layout = QHBoxLayout()
+        level_layout.addWidget(QLabel('日志级别:'))
+        level_layout.setSpacing(4)
+
+        self.log_level_checks = {}
+        for level_name in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
+            cb = QCheckBox(level_name)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._on_log_filter_changed)
+            level_layout.addWidget(cb)
+            self.log_level_checks[level_name] = cb
+
+        level_layout.addStretch()
+        filter_layout.addLayout(level_layout)
+
+        # 第二行：模块、日期范围、搜索
+        filter_row2 = QHBoxLayout()
+
+        filter_row2.addWidget(QLabel('模块:'))
+        self.log_module_combo = QComboBox()
+        self.log_module_combo.addItems(['全部', 'Scanner', 'Monitor', 'Firewall', 'Cloud', 'System'])
+        self.log_module_combo.currentTextChanged.connect(self._on_log_filter_changed)
+        filter_row2.addWidget(self.log_module_combo)
+
+        filter_row2.addSpacing(16)
+        filter_row2.addWidget(QLabel('从:'))
+        self.log_date_from = QDateEdit()
+        self.log_date_from.setCalendarPopup(True)
+        self.log_date_from.setDate(QDate(2000, 1, 1))
+        self.log_date_from.dateChanged.connect(self._on_log_filter_changed)
+        filter_row2.addWidget(self.log_date_from)
+
+        filter_row2.addWidget(QLabel('到:'))
+        self.log_date_to = QDateEdit()
+        self.log_date_to.setCalendarPopup(True)
+        self.log_date_to.setDate(QDate.currentDate())
+        self.log_date_to.dateChanged.connect(self._on_log_filter_changed)
+        filter_row2.addWidget(self.log_date_to)
+
+        filter_row2.addSpacing(16)
+        self.log_search_input = QLineEdit()
+        self.log_search_input.setPlaceholderText('搜索日志...')
+        self.log_search_input.setFixedWidth(200)
+        self.log_search_input.returnPressed.connect(self._on_log_filter_changed)
+        filter_row2.addWidget(self.log_search_input)
+
+        search_btn = QPushButton('🔍')
+        search_btn.setFixedSize(36, 36)
+        search_btn.clicked.connect(self._on_log_filter_changed)
+        filter_row2.addWidget(search_btn)
+
+        filter_layout.addLayout(filter_row2)
+        layout.addWidget(filter_bar)
+
+        # 日志表格
+        self.log_table = QTableWidget()
+        self.log_table.setColumnCount(5)
+        self.log_table.setHorizontalHeaderLabels(['时间', '级别', '模块', '来源', '消息'])
+        self.log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.log_table.verticalHeader().setVisible(False)
+        self.log_table.setAlternatingRowColors(True)
+        self.log_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.log_table, 1)
+
+        # 底部操作栏
+        action_bar = QHBoxLayout()
+
+        clear_btn = QPushButton('🗑️ 清空日志')
+        clear_btn.setObjectName('btnDanger')
+        clear_btn.setFixedSize(120, 36)
+        clear_btn.clicked.connect(self._clear_logs)
+        action_bar.addWidget(clear_btn)
+
+        export_btn2 = QPushButton('📥 导出日志')
+        export_btn2.setObjectName('btnSecondary')
+        export_btn2.setFixedSize(120, 36)
+        export_btn2.clicked.connect(self._export_logs)
+        action_bar.addWidget(export_btn2)
+
+        action_bar.addStretch()
+
+        self.log_auto_refresh_cb = QCheckBox('自动刷新')
+        self.log_auto_refresh_cb.setChecked(True)
+        self.log_auto_refresh_cb.stateChanged.connect(self._toggle_auto_refresh)
+        action_bar.addWidget(self.log_auto_refresh_cb)
+
+        action_bar.addWidget(QLabel('间隔:'))
+        self.log_refresh_interval = QComboBox()
+        self.log_refresh_interval.addItems(['1s', '5s', '10s', '30s'])
+        self.log_refresh_interval.setCurrentIndex(1)  # 5s default
+        self.log_refresh_interval.currentTextChanged.connect(self._on_refresh_interval_changed)
+        action_bar.addWidget(self.log_refresh_interval)
+
+        self.log_count_label = QLabel('共 0 条日志')
+        self.log_count_label.setStyleSheet('color: #5f6368; font-size: 12px;')
+        action_bar.addWidget(self.log_count_label)
+
+        layout.addLayout(action_bar)
+
+        # 自动刷新定时器
+        self.log_timer = QTimer()
+        self.log_timer.timeout.connect(self._refresh_logs)
+        self.log_timer.start(5000)
+
+        # 存储解析的日志
+        self.log_records = []
+
+        # 初始加载
+        self._refresh_logs()
+
+        return page
+
+    def _refresh_logs(self):
+        """刷新日志"""
+        self.log_records = self._parse_log_file()
+        self._apply_log_filters()
+
+    def _on_log_filter_changed(self):
+        """日志筛选条件变化"""
+        self._apply_log_filters()
+
+    def _apply_log_filters(self):
+        """应用日志筛选"""
+        # 获取筛选条件
+        enabled_levels = set()
+        for name, cb in self.log_level_checks.items():
+            if cb.isChecked():
+                enabled_levels.add(name)
+
+        module_filter = self.log_module_combo.currentText()
+        date_from = self.log_date_from.date()
+        date_to = self.log_date_to.date()
+        search_text = self.log_search_input.text().strip().lower()
+
+        filtered = []
+        for record in self.log_records:
+            # 级别筛选
+            if record['level'] not in enabled_levels:
+                continue
+
+            # 模块筛选
+            if module_filter != '全部':
+                module_map = {
+                    'Scanner': 'scanner',
+                    'Monitor': 'monitor',
+                    'Firewall': 'firewall',
+                    'Cloud': 'cloud',
+                    'System': 'tiandun',
+                }
+                expected = module_map.get(module_filter, module_filter.lower())
+                if expected not in record['module'].lower():
+                    continue
+
+            # 日期筛选
+            try:
+                record_date = QDate.fromString(record['timestamp'].split(' ')[0], 'yyyy-MM-dd')
+                if record_date < date_from or record_date > date_to:
+                    continue
+            except Exception:
+                pass
+
+            # 搜索文本筛选
+            if search_text:
+                if (search_text not in record['message'].lower()
+                        and search_text not in record['module'].lower()):
+                    continue
+
+            filtered.append(record)
+
+        # 更新表格
+        self.log_table.setRowCount(0)
+        for record in filtered:
+            row = self.log_table.rowCount()
+            self.log_table.insertRow(row)
+
+            self.log_table.setItem(row, 0, QTableWidgetItem(record['timestamp']))
+
+            level_item = QTableWidgetItem(record['level'])
+            # 颜色编码
+            if record['level'] == 'ERROR':
+                level_item.setForeground(QColor('#ffffff'))
+                level_item.setBackground(QColor('#ea4335'))
+            elif record['level'] == 'CRITICAL':
+                level_item.setForeground(QColor('#ffffff'))
+                level_item.setBackground(QColor('#d93025'))
+            elif record['level'] == 'WARNING':
+                level_item.setForeground(QColor('#1a1a1a'))
+                level_item.setBackground(QColor('#fdd663'))
+            elif record['level'] == 'INFO':
+                level_item.setForeground(QColor('#1a73e8'))
+            elif record['level'] == 'DEBUG':
+                level_item.setForeground(QColor('#5f6368'))
+            self.log_table.setItem(row, 1, level_item)
+
+            self.log_table.setItem(row, 2, QTableWidgetItem(record['module']))
+            self.log_table.setItem(row, 3, QTableWidgetItem(record.get('source', '')))
+            self.log_table.setItem(row, 4, QTableWidgetItem(record['message']))
+
+        self.log_count_label.setText(f'共 {len(filtered)} 条日志 (总 {len(self.log_records)} 条)')
+
+    def _export_logs(self):
+        """导出日志"""
+        filtered = []
+        for row in range(self.log_table.rowCount()):
+            filtered.append({
+                'timestamp': self.log_table.item(row, 0).text() if self.log_table.item(row, 0) else '',
+                'level': self.log_table.item(row, 1).text() if self.log_table.item(row, 1) else '',
+                'module': self.log_table.item(row, 2).text() if self.log_table.item(row, 2) else '',
+                'source': self.log_table.item(row, 3).text() if self.log_table.item(row, 3) else '',
+                'message': self.log_table.item(row, 4).text() if self.log_table.item(row, 4) else '',
+            })
+
+        if not filtered:
+            QMessageBox.information(self, '提示', '没有日志可导出')
+            return
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, '导出日志', 'logs_export',
+            'CSV 文件 (*.csv);;JSON 文件 (*.json)'
+        )
+
+        if not file_path:
+            return
+
+        try:
+            if file_path.endswith('.csv'):
+                import csv
+                with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['时间', '级别', '模块', '来源', '消息'])
+                    for record in filtered:
+                        writer.writerow([
+                            record['timestamp'], record['level'],
+                            record['module'], record['source'], record['message']
+                        ])
+            elif file_path.endswith('.json'):
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(filtered, f, ensure_ascii=False, indent=2)
+
+            QMessageBox.information(self, '导出成功', f'日志已导出到 {file_path}')
+        except Exception as e:
+            QMessageBox.critical(self, '导出失败', f'导出日志失败: {e}')
+
+    def _clear_logs(self):
+        """清空日志"""
+        reply = QMessageBox.warning(
+            self, '确认清空',
+            '确定要清空所有日志吗？\n此操作将删除日志文件内容！',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            log_path = os.path.join(PROJECT_ROOT, 'logs', 'tiandun.log')
+            if os.path.exists(log_path):
+                with open(log_path, 'w', encoding='utf-8') as f:
+                    f.write('')
+
+            error_log_path = os.path.join(PROJECT_ROOT, 'logs', 'tiandun.error.log')
+            if os.path.exists(error_log_path):
+                with open(error_log_path, 'w', encoding='utf-8') as f:
+                    f.write('')
+
+            self.log_records = []
+            self._apply_log_filters()
+            QMessageBox.information(self, '清空成功', '日志已清空')
+            self.add_activity('📋 日志已清空')
+        except Exception as e:
+            QMessageBox.critical(self, '清空失败', f'清空日志失败: {e}')
+
+    def _toggle_auto_refresh(self, state):
+        """切换自动刷新"""
+        if state:
+            interval_text = self.log_refresh_interval.currentText()
+            interval_ms = int(interval_text.replace('s', '')) * 1000
+            self.log_timer.start(interval_ms)
+        else:
+            self.log_timer.stop()
+
+    def _on_refresh_interval_changed(self, text: str):
+        """刷新间隔变化"""
+        if self.log_auto_refresh_cb.isChecked():
+            interval_ms = int(text.replace('s', '')) * 1000
+            self.log_timer.start(interval_ms)
+
+    def _parse_log_file(self) -> list:
+        """解析日志文件"""
+        records = []
+        log_path = os.path.join(PROJECT_ROOT, 'logs', 'tiandun.log')
+
+        if not os.path.exists(log_path):
+            return records
+
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+
+            # 从后向前解析（最新在前）
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split(' | ', 3)
+                if len(parts) >= 4:
+                    records.append({
+                        'timestamp': parts[0].strip(),
+                        'level': parts[1].strip(),
+                        'module': parts[2].strip(),
+                        'source': '',
+                        'message': parts[3].strip(),
+                    })
+                elif len(parts) == 3:
+                    records.append({
+                        'timestamp': parts[0].strip(),
+                        'level': parts[1].strip(),
+                        'module': '',
+                        'source': '',
+                        'message': parts[2].strip(),
+                    })
+
+                # 限制记录数量
+                if len(records) >= 10000:
+                    break
+
+        except Exception as e:
+            logger.error(f"解析日志文件失败: {e}")
+
+        return records
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """格式化文件大小"""
+        if size_bytes < 1024:
+            return f'{size_bytes} B'
+        elif size_bytes < 1024 * 1024:
+            return f'{size_bytes / 1024:.1f} KB'
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f'{size_bytes / 1024 / 1024:.1f} MB'
+        else:
+            return f'{size_bytes / 1024 / 1024 / 1024:.2f} GB'
+
+    # ============================================================
     # 功能方法
     # ============================================================
     def _start_scan(self, mode: str):
@@ -1060,6 +1817,12 @@ class MainWindow(QMainWindow):
                 self.stats_labels['total_scanned'].setText(str(total_scanned))
             if 'total_threats' in self.stats_labels:
                 self.stats_labels['total_threats'].setText(str(total_detected))
+            if 'quarantined' in self.stats_labels:
+                try:
+                    q_stats = self.quarantine_mgr.get_stats()
+                    self.stats_labels['quarantined'].setText(str(q_stats['total_items']))
+                except Exception:
+                    pass
         except Exception:
             pass
 

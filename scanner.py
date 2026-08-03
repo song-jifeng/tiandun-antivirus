@@ -314,8 +314,12 @@ class Scanner:
             from engine.signatures.signature_engine import SignatureEngine
             se = SignatureEngine()
             se.enabled = True
+            # 加载签名数据（使用 SQLite 惰性加载以节省内存）
+            load_stats = se.load_all_signatures()
+            logger.info(f"签名引擎加载完成: {se.name} - "
+                        f"内存签名: {load_stats.get('md5', 0) + load_stats.get('sha1', 0) + load_stats.get('sha256', 0)} 条, "
+                        f"SQLite可用: {load_stats.get('sqlite_total', 0)} 条")
             self.engines.append(se)
-            logger.info(f"加载签名引擎: {se.name}")
         except ImportError as e:
             logger.error(f"加载签名引擎失败: 模块未找到 - {e}")
         except Exception as e:

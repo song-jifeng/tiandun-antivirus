@@ -35,6 +35,9 @@ from .. import ScanEngine, ScanResult, ThreatInfo, ThreatType, ThreatLevel, Hash
 from . import signatures_ext
 from . import signatures_ext2
 
+# SQLite-backed lazy-loading signature database
+from .signature_db_manager import SignatureDBManager
+
 
 class BytePattern:
     """字节序列匹配模式
@@ -193,12 +196,17 @@ class SignatureEngine(ScanEngine):
         b'\x7fELF': ('ELF文件头', ThreatType.VIRUS),
     }
 
-    def __init__(self, name: str = 'signature', enabled: bool = True):
+    def __init__(self, name: str = 'signature', enabled: bool = True,
+                 use_sqlite: Optional[bool] = None):
         """初始化特征码引擎
 
         Args:
             name: 引擎名称
             enabled: 是否启用
+            use_sqlite: 是否使用 SQLite 惰性加载。
+                        True=使用SQLite，不加载ext文件到内存。
+                        False=传统模式，全部加载到内存。
+                        None=自动检测（优先使用SQLite，如果数据库存在且已验证签名>0）
         """
         super().__init__(name, enabled)
 
@@ -229,6 +237,12 @@ class SignatureEngine(ScanEngine):
         self._hash_cache: Dict[str, Dict[str, str]] = {}
         self._cache_lock = threading.RLock()
         self._cache_max = 10000
+
+        # SQLite 惰性加载支持
+        self._use_sqlite = use_sqlite
+        self._db_manager: Optional[SignatureDBManager] = None
+        self._sqlite_available = False
+        self._signatures_loaded = False  # 跟踪是否已加载签名
 
     # ----------------------------------------------------------
     # 签名数据库管理
@@ -360,12 +374,92 @@ class SignatureEngine(ScanEngine):
                     continue
         return count
 
-    def load_all_signatures(self) -> Dict[str, int]:
-        """加载所有签名数据（从 signatures 模块）
+    def load_from_sqlite(self) -> Dict[str, int]:
+        """从 SQLite 数据库惰性加载签名
+
+        仅加载 signatures.py 中的小规模签名（22K 条）到内存作为快速查找。
+        对于 ext 文件中的大量签名（300K+ 条），查询 SQLite 按需获取，
+        避免全部加载到内存中。
 
         Returns:
-            {md5: N, sha1: N, sha256: N, byte_patterns: N, yara_rules: N}
+            {md5: N, sha1: N, sha256: N, sqlite_total: N, sqlite_verified: N}
         """
+        stats = {}
+
+        # 1. 加载 signatures.py 中的小规模签名到内存 (快速查找)
+        from . import signatures as sig_module
+
+        if hasattr(sig_module, 'ALL_SIGNATURES'):
+            stats['md5'] = self.load_md5_signatures(sig_module.ALL_SIGNATURES)
+
+        if hasattr(sig_module, 'SHA1_SIGNATURES'):
+            stats['sha1'] = self.load_sha1_signatures(sig_module.SHA1_SIGNATURES)
+
+        if hasattr(sig_module, 'SHA256_SIGNATURES'):
+            stats['sha256'] = self.load_sha256_signatures(sig_module.SHA256_SIGNATURES)
+
+        # 加载字节序列特征（较小，可以接受）
+        if hasattr(sig_module, 'BYTE_PATTERNS'):
+            stats['byte_patterns'] = self.load_byte_patterns(sig_module.BYTE_PATTERNS)
+
+        # 加载 YARA 规则（较小）
+        if hasattr(sig_module, 'YARA_RULES'):
+            stats['yara_rules'] = self.load_yara_rules(sig_module.YARA_RULES)
+
+        # 2. 初始化 SQLite 连接
+        self._db_manager = SignatureDBManager()
+        if self._db_manager.initialize():
+            self._sqlite_available = True
+            db_stats = self._db_manager.get_stats()
+            stats['sqlite_total'] = db_stats['total_signatures']
+            stats['sqlite_verified'] = db_stats['verified_count']
+
+            # 仅当 SQLite 中有签名时才标记为可用
+            if db_stats['total_signatures'] > 0:
+                self._use_sqlite = True
+            else:
+                # SQLite 数据库存在但为空，需要转换
+                print(f"[SignatureEngine] SQLite database is empty. "
+                      f"Run 'python tools/convert_signatures_to_sqlite.py' to populate it.")
+                self._use_sqlite = False
+        else:
+            self._sqlite_available = False
+            self._use_sqlite = False
+            stats['sqlite_total'] = 0
+            stats['sqlite_verified'] = 0
+            print(f"[SignatureEngine] SQLite database not available, "
+                  f"falling back to in-memory loading for all signatures.")
+
+        self._signatures_loaded = True
+        return stats
+
+    def load_all_signatures(self, use_sqlite: Optional[bool] = None) -> Dict[str, int]:
+        """加载所有签名数据
+
+        SQLite 模式（推荐）：
+            - 加载 signatures.py 中的小规模签名（22K 条）到内存
+            - 从 SQLite 数据库按需查询 ext 文件中的签名（300K+ 条）
+            - 内存占用：~5MB 而不是 300-500MB
+
+        传统模式（use_sqlite=False）：
+            - 加载所有签名到内存（兼容旧行为）
+            - 内存占用：300-500MB
+
+        Args:
+            use_sqlite: True=使用SQLite惰性加载，False=传统模式全部加载到内存，
+                       None=自动检测（优先使用SQLite）
+
+        Returns:
+            {md5: N, sha1: N, sha256: N, byte_patterns: N, yara_rules: N, ...}
+        """
+        if use_sqlite is not None:
+            self._use_sqlite = use_sqlite
+
+        # 如果启用 SQLite，使用惰性加载模式
+        if self._use_sqlite is not False:
+            return self.load_from_sqlite()
+
+        # 传统模式：全部加载到内存
         from . import signatures as sig_module
 
         stats = {}
@@ -448,7 +542,44 @@ class SignatureEngine(ScanEngine):
             stats['ext2_sha1'] = ext2_count['sha1']
             stats['ext2_sha256'] = ext2_count['sha256']
 
+        self._signatures_loaded = True
         return stats
+
+    def configure_sqlite(self, use_sqlite: bool = True) -> bool:
+        """配置是否使用 SQLite 惰性加载
+
+        Args:
+            use_sqlite: True=惰性加载（低内存），False=全部加载到内存
+
+        Returns:
+            SQLite 是否可用
+        """
+        self._use_sqlite = use_sqlite
+        if use_sqlite:
+            if not self._sqlite_available:
+                # 尝试初始化 SQLite
+                self._db_manager = SignatureDBManager()
+                if self._db_manager.initialize():
+                    self._sqlite_available = True
+                    if self._db_manager.get_total_count() > 0:
+                        return True
+                    else:
+                        print(f"[SignatureEngine] SQLite database is empty.")
+                        return False
+                else:
+                    return False
+            return True
+        return True
+
+    def get_sqlite_stats(self) -> Optional[Dict[str, Any]]:
+        """获取 SQLite 数据库统计信息
+
+        Returns:
+            SQLite 统计字典，或 None（如果不可用）
+        """
+        if self._db_manager and self._sqlite_available:
+            return self._db_manager.get_stats()
+        return None
 
     def clear_signatures(self):
         """清除所有已加载的签名"""
@@ -544,6 +675,8 @@ class SignatureEngine(ScanEngine):
 
         先检查缓存，再计算哈希。
         匹配顺序：MD5 -> SHA1 -> SHA256（速度由快到慢）
+
+        如果内存中未找到，且 SQLite 模式已启用，则回退到 SQLite 查询。
         """
         # 检查缓存
         with self._cache_lock:
@@ -564,6 +697,12 @@ class SignatureEngine(ScanEngine):
                 if md5_val in self.md5_db:
                     return self.md5_db[md5_val]
 
+            # SQLite 回退：内存中未找到，查询 SQLite 数据库
+            if self._use_sqlite and self._sqlite_available:
+                result = self._db_manager.lookup_by_md5(md5_val)
+                if result:
+                    return self._sqlite_row_to_threatinfo(result, md5_val)
+
         # SHA1 匹配
         if not sha1_val:
             sha1_val = HashUtil.sha1_file(filepath)
@@ -572,6 +711,12 @@ class SignatureEngine(ScanEngine):
                 if sha1_val in self.sha1_db:
                     return self.sha1_db[sha1_val]
 
+            # SQLite 回退
+            if self._use_sqlite and self._sqlite_available:
+                result = self._db_manager.lookup_by_sha1(sha1_val)
+                if result:
+                    return self._sqlite_row_to_threatinfo(result, sha1_val)
+
         # SHA256 匹配（最慢）
         if not sha256_val:
             sha256_val = HashUtil.sha256_file(filepath)
@@ -579,6 +724,12 @@ class SignatureEngine(ScanEngine):
             with self._lock:
                 if sha256_val in self.sha256_db:
                     return self.sha256_db[sha256_val]
+
+            # SQLite 回退
+            if self._use_sqlite and self._sqlite_available:
+                result = self._db_manager.lookup_by_sha256(sha256_val)
+                if result:
+                    return self._sqlite_row_to_threatinfo(result, sha256_val)
 
         # 写入缓存
         if filepath not in self._hash_cache:
@@ -739,6 +890,25 @@ class SignatureEngine(ScanEngine):
         }
         return threat
 
+    def _sqlite_row_to_threatinfo(self, row: Dict, hash_val: str = '') -> ThreatInfo:
+        """将 SQLite 行字典转换为 ThreatInfo 对象"""
+        threat = ThreatInfo(
+            file_path='',
+            threat_type=row.get('threat_type', ThreatType.UNKNOWN),
+            threat_name=row.get('name', ''),
+            threat_level=int(row.get('level', ThreatLevel.MEDIUM)),
+            result=ScanResult.MALICIOUS
+        )
+        threat.details = {
+            'desc': row.get('description', ''),
+            'family': row.get('family', ''),
+            'hash': hash_val,
+            'source': row.get('source', 'sqlite'),
+            'is_verified': row.get('is_verified', 0),
+            'engine': 'hash'
+        }
+        return threat
+
     def scan_batch(self, filepaths: List[str]) -> List[ThreatInfo]:
         """批量扫描文件，覆盖基类方法
 
@@ -772,9 +942,17 @@ class SignatureEngine(ScanEngine):
 # 便捷函数
 # ============================================================
 
-def create_default_engine() -> SignatureEngine:
-    """创建并初始化默认特征码引擎"""
-    engine = SignatureEngine()
+def create_default_engine(use_sqlite: bool = True) -> SignatureEngine:
+    """创建并初始化默认特征码引擎
+
+    Args:
+        use_sqlite: 是否使用 SQLite 惰性加载（低内存模式）。
+                    True=仅加载小签名到内存，大签名通过 SQLite 按需查询。
+
+    Returns:
+        初始化后的 SignatureEngine 实例
+    """
+    engine = SignatureEngine(use_sqlite=use_sqlite)
     engine.load_all_signatures()
     return engine
 

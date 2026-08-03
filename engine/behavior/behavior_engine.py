@@ -3,6 +3,12 @@
 """
 天盾 Antivirus - 行为分析引擎
 整合进程、文件、注册表、网络监控，进行行为关联分析
+
+架构说明:
+  - ProcessMonitor: 委托 process_monitor.py (WMI 事件驱动 + psutil 轮询 5s 后备)
+  - FileMonitor:    委托 file_monitor.py (watchdog 事件驱动 + ReadDirectoryChangesW + 轮询后备)
+  - RegistryMonitor: 使用 RegNotifyChangeKeyValue 实时事件驱动 (不轮询)
+  - NetworkMonitor:  委托 network_monitor.py (IPHLPAPI ctypes + 10s 轮询 + 速率限制)
 """
 import os
 import sys
@@ -30,6 +36,10 @@ from engine.behavior.win_registry import (
 )
 
 
+# ============================================================
+# 行为事件定义
+# ============================================================
+
 class BehaviorEvent:
     """行为事件"""
     def __init__(self, event_type: str, pid: int, process_name: str,
@@ -53,6 +63,30 @@ class BehaviorEvent:
             'details': self.details,
         }
 
+
+class ThreatEvent:
+    """
+    威胁事件 - 由子监控器 (process_monitor, file_monitor) 生成，
+    传递给 BehaviorEngine.on_threat_detected() 进行统一处理。
+    """
+    def __init__(self, source: str = '', rule_id: str = '', rule_name: str = '',
+                 severity: int = 0, score: int = 0, confidence: int = 0,
+                 description: str = '', event_data: Optional[Dict] = None,
+                 timestamp: float = 0):
+        self.source = source
+        self.rule_id = rule_id
+        self.rule_name = rule_name
+        self.severity = severity
+        self.score = score
+        self.confidence = confidence
+        self.description = description
+        self.event_data = event_data or {}
+        self.timestamp = timestamp or time.time()
+
+
+# ============================================================
+# 行为检测规则
+# ============================================================
 
 class BehaviorRule:
     """行为检测规则"""
@@ -162,105 +196,401 @@ class BehaviorRules:
         ]
 
 
-class ProcessMonitor:
-    """进程监控器"""
-    def __init__(self):
+# ============================================================
+# WMI 进程缓存 (用于 _get_calling_process 改进)
+# ============================================================
+
+class ProcessCache:
+    """
+    WMI 进程缓存 — 通过 Win32_ProcessStartTrace 实时跟踪进程创建。
+    用于 _get_calling_process() 提供更准确的进程信息。
+    在 WMI 不可用时降级为 psutil 查询。
+    """
+    def __init__(self, max_age: float = 5.0):
+        self._cache: Dict[int, Tuple[str, float]] = {}  # pid -> (name, timestamp)
+        self._max_age = max_age
+        self._lock = threading.Lock()
         self._running = False
-        self._thread = None
-        self._known_processes = set()
-        self._events: List[BehaviorEvent] = []
+        self._thread: Optional[threading.Thread] = None
+        self._wmi_available = False
 
     def start(self):
+        """启动 WMI 进程缓存"""
+        if self._running:
+            return
         self._running = True
-        self._thread = threading.Thread(target=self._monitor, daemon=True)
+        self._thread = threading.Thread(target=self._wmi_loop, daemon=True, name='ProcessCache')
         self._thread.start()
 
     def stop(self):
+        """停止 WMI 进程缓存"""
         self._running = False
 
-    def _monitor(self):
-        while self._running:
-            try:
-                self._check_new_processes()
-            except Exception:
-                pass
-            time.sleep(2)
+    def _wmi_loop(self):
+        """WMI 事件循环 — 收集进程创建事件"""
+        import pythoncom  # type: ignore
+        pythoncom.CoInitialize()
 
-    def _check_new_processes(self):
+        # 优先尝试 wmi 模块
         try:
-            import psutil
-            current = set()
-            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+            import wmi  # type: ignore
+            c = wmi.WMI()
+            watcher = c.WatchFor(
+                notification_type="Creation",
+                wmi_class="Win32_ProcessStartTrace",
+            )
+            self._wmi_available = True
+            while self._running:
                 try:
-                    current.add((proc.info['pid'], proc.info['name']))
-                    if proc.info['pid'] not in {p[0] for p in self._known_processes}:
-                        if proc.info['exe']:
-                            self._events.append(BehaviorEvent(
-                                'process', proc.info['pid'], proc.info['name'],
-                                'start', proc.info['exe']
-                            ))
+                    event = watcher(timeout_ms=1000)
+                    if event is not None:
+                        with self._lock:
+                            self._cache[event.ProcessID] = (event.ProcessName, time.time())
                 except Exception:
                     pass
-            self._known_processes = current
+            return
         except ImportError:
             pass
+        except Exception:
+            pass
+
+        # 回退到 win32com.client
+        try:
+            import win32com.client  # type: ignore
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", "root\\cimv2")
+            events = service.ExecNotificationQuery("SELECT * FROM Win32_ProcessStartTrace")
+            self._wmi_available = True
+            while self._running:
+                try:
+                    event = events.NextEvent(1000)
+                    if event is not None:
+                        with self._lock:
+                            self._cache[event.ProcessID] = (event.ProcessName, time.time())
+                except Exception:
+                    pass
+        except ImportError:
+            self._wmi_available = False
+        except Exception:
+            self._wmi_available = False
+
+    def get_most_recent(self) -> Tuple[str, int]:
+        """
+        返回最近启动的进程 (name, pid)。
+        从缓存中取时间戳最新的条目，同时清理过期条目。
+        """
+        now = time.time()
+        with self._lock:
+            # 清理过期条目
+            expired = [pid for pid, (_, ts) in self._cache.items() if now - ts > self._max_age]
+            for pid in expired:
+                del self._cache[pid]
+
+            if not self._cache:
+                return '', 0
+
+            # 返回最近启动的进程
+            most_recent = max(self._cache.items(), key=lambda x: x[1][1])
+            pid, (name, _) = most_recent
+            return name, pid
+
+    def get_process_name(self, pid: int) -> str:
+        """查询指定 PID 的进程名（从缓存中）"""
+        with self._lock:
+            if pid in self._cache:
+                return self._cache[pid][0]
+        return ''
+
+    def is_available(self) -> bool:
+        return self._wmi_available
+
+
+# ============================================================
+# 监控器 — 委托实现
+# ============================================================
+
+class ProcessMonitor:
+    """
+    进程监控器 — 委托 engine.behavior.process_monitor.ProcessMonitor。
+    WMI 事件驱动（Win32_ProcessStartTrace / Win32_ProcessStopTrace），
+    psutil 5s 轮询作为后备。
+    """
+    def __init__(self, engine=None):
+        self._engine = engine
+        self._running = False
+        self._monitor = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        try:
+            from engine.behavior.process_monitor import ProcessMonitor as _ProcessMonitor
+            self._monitor = _ProcessMonitor(engine=self._engine)
+            self._monitor.start()
+            logger.info("行为引擎: ProcessMonitor 已委托到 process_monitor.py")
+        except Exception as e:
+            logger.error(f"行为引擎: ProcessMonitor 委托启动失败: {e}")
+
+    def stop(self):
+        self._running = False
+        if self._monitor:
+            try:
+                self._monitor.stop()
+            except Exception:
+                pass
 
     def get_events(self) -> List[BehaviorEvent]:
-        events = list(self._events)
-        self._events.clear()
+        """从 process_monitor 获取事件并转换为 BehaviorEvent"""
+        events = []
+        if self._monitor:
+            try:
+                for pe in self._monitor.get_events():
+                    events.append(BehaviorEvent(
+                        event_type='process',
+                        pid=pe.pid,
+                        process_name=pe.process_name,
+                        action=pe.event_type,
+                        target=pe.process_path or pe.process_name,
+                        details=pe.to_dict(),
+                    ))
+            except Exception as e:
+                logger.debug("ProcessMonitor 获取事件失败: %s", e)
         return events
 
 
 class FileMonitor:
-    """文件监控器"""
-    def __init__(self):
+    """
+    文件监控器 — 委托 engine.behavior.file_monitor.FileMonitor。
+    watchdog 事件驱动 + ReadDirectoryChangesW 辅助 + 轮询后备。
+    """
+    def __init__(self, engine=None):
+        self._engine = engine
+        self._running = False
+        self._monitor = None           # file_monitor.py 的 FileMonitor
+        self._rdcw_monitor = None      # ReadDirectoryChangesW 辅助监控
+        self._events: List[BehaviorEvent] = []
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+
+        # 启动 file_monitor.py 的 FileMonitor (watchdog + 轮询)
+        try:
+            from engine.behavior.file_monitor import FileMonitor as _FileMonitor
+            self._monitor = _FileMonitor(engine=self._engine)
+            self._monitor.start()
+            logger.info("行为引擎: FileMonitor 已委托到 file_monitor.py")
+        except Exception as e:
+            logger.error(f"行为引擎: FileMonitor 委托启动失败: {e}")
+
+        # 尝试启动 ReadDirectoryChangesW 辅助监控
+        self._try_start_rdcw()
+
+    def stop(self):
+        self._running = False
+        if self._monitor:
+            try:
+                self._monitor.stop()
+            except Exception:
+                pass
+        self._stop_rdcw()
+
+    def _try_start_rdcw(self):
+        """尝试使用 ReadDirectoryChangesW 作为辅助事件源"""
+        if sys.platform != 'win32':
+            return
+        try:
+            self._rdcw_monitor = _ReadDirectoryChangesMonitor(
+                on_event=self._on_rdcw_event,
+            )
+            self._rdcw_monitor.start()
+            logger.info("行为引擎: ReadDirectoryChangesW 辅助监控已启动")
+        except Exception as e:
+            logger.debug("行为引擎: ReadDirectoryChangesW 不可用: %s", e)
+
+    def _stop_rdcw(self):
+        if self._rdcw_monitor:
+            try:
+                self._rdcw_monitor.stop()
+            except Exception:
+                pass
+            self._rdcw_monitor = None
+
+    def _on_rdcw_event(self, action: str, file_path: str):
+        """ReadDirectoryChangesW 回调 — 转换为 BehaviorEvent"""
+        self._events.append(BehaviorEvent(
+            event_type='file',
+            pid=0,
+            process_name='system',
+            action=action,
+            target=file_path,
+            details={'source': 'ReadDirectoryChangesW'},
+        ))
+
+    def get_events(self) -> List[BehaviorEvent]:
+        """从 file_monitor 获取事件并转换为 BehaviorEvent"""
+        events = []
+        if self._monitor:
+            try:
+                for fe in self._monitor.get_events():
+                    events.append(BehaviorEvent(
+                        event_type='file',
+                        pid=fe.process_pid or 0,
+                        process_name=fe.process_name or 'system',
+                        action=fe.event_type,
+                        target=fe.file_path,
+                        details=fe.to_dict(),
+                    ))
+            except Exception as e:
+                logger.debug("FileMonitor 获取事件失败: %s", e)
+
+        # 合并 ReadDirectoryChangesW 事件
+        events.extend(self._events)
+        self._events.clear()
+        return events
+
+
+class _ReadDirectoryChangesMonitor:
+    """
+    ReadDirectoryChangesW 辅助监控器。
+    监控关键目录，当文件变更时通过回调通知。
+    作为 watchdog 的补充，用于 watchdog 无法覆盖的目录。
+    """
+    def __init__(self, on_event=None):
+        self._on_event = on_event
         self._running = False
         self._thread = None
-        self._events: List[BehaviorEvent] = []
-        self._watch_paths = [
-            os.environ.get('TEMP', 'C:\\Temp'),
-            os.environ.get('APPDATA', ''),
-            os.environ.get('LOCALAPPDATA', ''),
-            'C:\\Windows\\Temp',
-        ]
+        self._handles = {}
 
     def start(self):
         self._running = True
-        self._thread = threading.Thread(target=self._monitor, daemon=True)
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
+        if self._handles:
+            try:
+                kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                for h in self._handles.values():
+                    try:
+                        kernel32.CancelIo(h)
+                        kernel32.CloseHandle(h)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._handles.clear()
 
-    def _monitor(self):
+    def _monitor_loop(self):
+        """ReadDirectoryChangesW 监控循环"""
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        from ctypes import wintypes, create_string_buffer, sizeof, byref, c_ubyte, c_uint
+
+        FILE_LIST_DIRECTORY = 0x0001
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_EXISTING = 3
+        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+        FILE_FLAG_OVERLAPPED = 0x40000000
+
+        # 要监控的目录
+        watch_dirs = set()
+        for d in [os.environ.get('TEMP', ''), os.environ.get('TMP', ''),
+                  os.environ.get('APPDATA', ''), 'C:\\Windows\\Temp']:
+            if d and os.path.isdir(d):
+                watch_dirs.add(d)
+
+        # 打开目录句柄
+        for wd in watch_dirs:
+            try:
+                h = kernel32.CreateFileW(
+                    wd,
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                    None,
+                )
+                if h and h not in (-1, 0):
+                    self._handles[wd] = h
+            except Exception:
+                pass
+
+        if not self._handles:
+            return
+
+        # 监控循环
+        buf_size = 65536
+        FILE_NOTIFY_CHANGE_ALL = (
+            0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 |
+            0x00000010 | 0x00000040
+        )
+
         while self._running:
-            try:
-                self._check_file_changes()
-            except Exception:
-                pass
-            time.sleep(5)
+            for watch_dir, h_dir in list(self._handles.items()):
+                if not self._running:
+                    break
+                try:
+                    buf = create_string_buffer(buf_size)
+                    bytes_returned = c_uint(0)
+                    success = kernel32.ReadDirectoryChangesW(
+                        h_dir, buf, sizeof(buf), True,
+                        FILE_NOTIFY_CHANGE_ALL,
+                        byref(bytes_returned), None, None,
+                    )
+                    if success and bytes_returned.value > 0:
+                        self._parse_notifications(buf, bytes_returned.value, watch_dir)
+                except Exception:
+                    time.sleep(0.5)
 
-    def _check_file_changes(self):
-        for path in self._watch_paths:
-            if not path or not os.path.exists(path):
-                continue
-            try:
-                for f in os.listdir(path)[:100]:
-                    fpath = os.path.join(path, f)
-                    if os.path.isfile(fpath):
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in ('.exe', '.dll', '.scr', '.bat', '.ps1'):
-                            self._events.append(BehaviorEvent(
-                                'file', 0, 'system',
-                                'create', fpath
-                            ))
-            except Exception:
-                pass
+    def _parse_notifications(self, buffer, bytes_returned, watch_dir):
+        """解析 FILE_NOTIFY_INFORMATION 结构"""
+        try:
+            offset = 0
+            while offset < bytes_returned:
+                # 读取 FILE_NOTIFY_INFORMATION 头部
+                data = buffer.raw
+                if offset + 12 > len(data):
+                    break
 
-    def get_events(self) -> List[BehaviorEvent]:
-        events = list(self._events)
-        self._events.clear()
-        return events
+                next_offset = int.from_bytes(data[offset:offset+4], 'little')
+                action = int.from_bytes(data[offset+4:offset+8], 'little')
+                name_len = int.from_bytes(data[offset+8:offset+12], 'little')
+
+                if name_len <= 0 or offset + 12 + name_len > len(data):
+                    break
+
+                # 读取文件名 (UTF-16LE)
+                file_name = data[offset+12:offset+12+name_len].decode('utf-16-le', errors='replace')
+                full_path = os.path.join(watch_dir, file_name)
+
+                # 动作映射
+                action_map = {
+                    1: 'create',
+                    2: 'delete',
+                    3: 'modify',
+                    4: 'rename',
+                    5: 'rename',
+                }
+                action_str = action_map.get(action, 'modify')
+
+                # 回调触发
+                if self._on_event:
+                    try:
+                        self._on_event(action_str, full_path)
+                    except Exception:
+                        pass
+
+                if next_offset == 0:
+                    break
+                offset += next_offset
+        except Exception:
+            pass
 
 
 class RegistryMonitor:
@@ -329,71 +659,72 @@ class RegistryMonitor:
 
 
 class NetworkMonitor:
-    """网络监控器"""
-    def __init__(self):
+    """
+    网络监控器 — 委托 engine.behavior.network_monitor.NetworkMonitor。
+    IPHLPAPI ctypes 高效查询 + 10s 轮询 + 速率限制。
+    """
+    def __init__(self, engine=None):
+        self._engine = engine
         self._running = False
-        self._thread = None
-        self._events: List[BehaviorEvent] = []
-        self._known_connections = set()
+        self._monitor = None
 
     def start(self):
+        if self._running:
+            return
         self._running = True
-        self._thread = threading.Thread(target=self._monitor, daemon=True)
-        self._thread.start()
+        try:
+            from engine.behavior.network_monitor import NetworkMonitor as _NetworkMonitor
+            self._monitor = _NetworkMonitor(engine=self._engine)
+            self._monitor.start()
+            logger.info("行为引擎: NetworkMonitor 已委托到 network_monitor.py")
+        except Exception as e:
+            logger.error(f"行为引擎: NetworkMonitor 委托启动失败: {e}")
 
     def stop(self):
         self._running = False
-
-    def _monitor(self):
-        while self._running:
+        if self._monitor:
             try:
-                self._check_connections()
+                self._monitor.stop()
             except Exception:
                 pass
-            time.sleep(5)
-
-    def _check_connections(self):
-        try:
-            import psutil
-            current = set()
-            for conn in psutil.net_connections():
-                if conn.raddr:
-                    key = (conn.pid, conn.raddr.ip, conn.raddr.port)
-                    current.add(key)
-                    if key not in self._known_connections:
-                        proc_name = ''
-                        if conn.pid:
-                            try:
-                                proc_name = psutil.Process(conn.pid).name()
-                            except Exception:
-                                pass
-                        self._events.append(BehaviorEvent(
-                            'network', conn.pid or 0, proc_name,
-                            'connect', f"{conn.raddr.ip}:{conn.raddr.port}"
-                        ))
-            self._known_connections = current
-        except ImportError:
-            pass
 
     def get_events(self) -> List[BehaviorEvent]:
-        events = list(self._events)
-        self._events.clear()
+        """从 network_monitor 获取事件并转换为 BehaviorEvent"""
+        events = []
+        if self._monitor:
+            try:
+                for ne in self._monitor.get_events():
+                    events.append(BehaviorEvent(
+                        event_type='network',
+                        pid=ne.pid,
+                        process_name=ne.process_name,
+                        action=ne.event_type,
+                        target=f"{ne.remote_ip}:{ne.remote_port}",
+                        details=ne.to_dict(),
+                    ))
+            except Exception as e:
+                logger.debug("NetworkMonitor 获取事件失败: %s", e)
         return events
 
+
+# ============================================================
+# 行为引擎
+# ============================================================
 
 class BehaviorEngine(ScanEngine):
     """行为分析引擎 - 整合所有监控器，进行行为关联分析"""
 
     def __init__(self):
         super().__init__('BehaviorEngine', enabled=False)
-        self.process_monitor = ProcessMonitor()
-        self.file_monitor = FileMonitor()
+        self.process_monitor = ProcessMonitor(engine=self)
+        self.file_monitor = FileMonitor(engine=self)
         self.registry_monitor = RegistryMonitor()
-        self.network_monitor = NetworkMonitor()
+        self.network_monitor = NetworkMonitor(engine=self)
         self.rules = BehaviorRules.get_rules()
         self.event_history = deque(maxlen=1000)
         self._running = False
         self._thread = None
+        self._process_cache = ProcessCache()
 
     def start(self):
         """启动行为监控"""
@@ -405,6 +736,7 @@ class BehaviorEngine(ScanEngine):
         self.file_monitor.start()
         self.registry_monitor.start()
         self.network_monitor.start()
+        self._process_cache.start()
 
         self._thread = threading.Thread(target=self._analyze_loop, daemon=True)
         self._thread.start()
@@ -417,6 +749,7 @@ class BehaviorEngine(ScanEngine):
         self.file_monitor.stop()
         self.registry_monitor.stop()
         self.network_monitor.stop()
+        self._process_cache.stop()
         logger.info("行为分析引擎已停止")
 
     def _analyze_loop(self):
@@ -482,10 +815,68 @@ class BehaviorEngine(ScanEngine):
         }
         logger.warning(f"行为检测: {rule.name} - {event.target}")
 
+    def on_threat_detected(self, threat: ThreatEvent):
+        """
+        子监控器 (process_monitor, file_monitor) 检测到威胁时回调。
+        将 ThreatEvent 转换为 ThreatInfo 并记录。
+        """
+        target = ''
+        if threat.event_data:
+            target = threat.event_data.get('file_path', '') or threat.event_data.get('process_path', '')
+        threat_info = ThreatInfo(
+            file_path=target or 'unknown',
+            threat_type=ThreatType.BEHAVIOR,
+            threat_name=f"Behavior.{threat.rule_id}.{threat.rule_name}",
+            scan_engine=self.name,
+            threat_level=threat.severity,
+            result=ScanResult.MALICIOUS,
+        )
+        threat_info.details = {
+            'source': threat.source,
+            'rule_id': threat.rule_id,
+            'rule_name': threat.rule_name,
+            'description': threat.description,
+            'confidence': threat.confidence,
+            'score': threat.score,
+            'event_data': threat.event_data,
+        }
+        logger.warning(
+            f"[{threat.source}] {threat.rule_name} - 置信度={threat.confidence}% 评分={threat.score}"
+        )
+
     def scan(self, filepath: str) -> Optional[ThreatInfo]:
         """行为引擎在扫描时不主动检测，通过实时监控工作"""
         return None
 
+    # ------------------------------------------------------------
+    # _get_calling_process 改进 — 使用 WMI 进程缓存
+    # ------------------------------------------------------------
+    def _get_calling_process(self) -> Tuple[str, int]:
+        """
+        获取最近启动的进程信息，用于关联文件操作与进程。
+        优先使用 WMI 进程缓存，回退到 psutil 父进程查询。
+        """
+        # 优先使用 WMI 缓存
+        if self._process_cache.is_available():
+            name, pid = self._process_cache.get_most_recent()
+            if name:
+                return name, pid
+
+        # 回退到 psutil
+        try:
+            import psutil
+            current = psutil.Process()
+            proc = current.parent()
+            if proc:
+                return proc.name() or '', proc.pid or 0
+        except Exception:
+            pass
+        return '', 0
+
+
+# ============================================================
+# HIPS 主动防御
+# ============================================================
 
 class HIPSEngine:
     """主动防御系统 - 实时拦截高危操作"""

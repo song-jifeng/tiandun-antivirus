@@ -37,3 +37,6 @@ test_eicar.txt
 # Generated cache
 cache/
 tools/fetched_hashes.json
+
+# Generated signature database (regenerate from Python source files)
+engine/signatures/signatures.db

@@ -25,6 +25,7 @@
 
 from .signature_engine import SignatureEngine
 from .signature_db import SignatureDatabase
+from .signature_db_manager import SignatureDBManager
 from .yara_engine import YaraEngine, YaraRule
 from .heuristics import HeuristicRules
 from .signatures import (
@@ -51,6 +52,7 @@ from .signatures import (
 __all__ = [
     'SignatureEngine',
     'SignatureDatabase',
+    'SignatureDBManager',
     'YaraEngine',
     'YaraRule',
     'HeuristicRules',
