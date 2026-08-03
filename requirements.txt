@@ -1,4 +1,4 @@
-PyQt5>=5.15.0
+PyQt5>=5.15.11
 psutil>=5.9.0
 pywin32>=305
 watchdog>=3.0.0
