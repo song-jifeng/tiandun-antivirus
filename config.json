@@ -1,0 +1,80 @@
+{
+    "general": {
+        "language": "zh_CN",
+        "auto_start": false,
+        "minimize_to_tray": true,
+        "show_notifications": true,
+        "theme": "light",
+        "check_update": true,
+        "update_interval_hours": 24
+    },
+    "realtime": {
+        "enabled": true,
+        "file_monitor": true,
+        "process_monitor": true,
+        "registry_monitor": true,
+        "network_monitor": true,
+        "usb_scan": true,
+        "download_scan": true,
+        "office_macro_scan": true,
+        "monitor_level": "normal",
+        "scan_on_write": true,
+        "scan_on_execute": true
+    },
+    "scan": {
+        "max_file_size_mb": 200,
+        "archive_scan": true,
+        "heuristic_level": "medium",
+        "cpu_priority": "low",
+        "thread_count": 4,
+        "delete_to_quarantine": true
+    },
+    "cloud": {
+        "enabled": true,
+        "timeout_seconds": 10,
+        "cache_size": 10000,
+        "cache_ttl_hours": 24,
+        "offline_mode": false,
+        "privacy_mode": true
+    },
+    "hips": {
+        "enabled": true,
+        "level": "normal",
+        "block_unknown": false,
+        "auto_allow_signed": true
+    },
+    "self_protection": {
+        "enabled": true,
+        "protect_process": true,
+        "protect_files": true,
+        "protect_registry": true,
+        "watchdog_enabled": true,
+        "watchdog_interval_seconds": 5
+    },
+    "cleanup": {
+        "backup_before_clean": true,
+        "clean_registry": true,
+        "clean_services": true,
+        "clean_tasks": true,
+        "clean_startup": true,
+        "repair_hosts": true,
+        "repair_association": true,
+        "repair_browser": true,
+        "quarantine_retention_days": 30
+    },
+    "firewall": {
+        "enabled": true,
+        "mode": "auto",
+        "block_incoming": true,
+        "ransomware_honeypot": true,
+        "intrusion_detection": true,
+        "dns_protection": true
+    },
+    "logging": {
+        "level": "info",
+        "max_size_mb": 50,
+        "max_files": 10,
+        "log_scan_results": true,
+        "log_threats": true
+    }
+}
