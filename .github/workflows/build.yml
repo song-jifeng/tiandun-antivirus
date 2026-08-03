@@ -21,7 +21,7 @@ jobs:
       run: |
         pyinstaller --onefile --windowed --name "TiandunAntivirus" --icon=icon.ico main.py 2>&1 || echo "Build may need adjustments"
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: TiandunAntivirus-windows
         path: dist/TiandunAntivirus.exe
